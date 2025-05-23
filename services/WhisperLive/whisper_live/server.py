@@ -954,6 +954,17 @@ class TranscriptionServer:
             # Check if this is a text message (JSON) rather than binary audio data
             if isinstance(frame_data, str):
                 return self.process_websocket_message(websocket, frame_data)
+            elif isinstance(frame_data, bytes):
+                # Try to decode as UTF-8 and see if it's JSON
+                try:
+                    decoded_str = frame_data.decode('utf-8')
+                    # Try parsing as JSON to see if it's a message
+                    json.loads(decoded_str)
+                    # If we get here, it's a JSON message
+                    return self.process_websocket_message(websocket, decoded_str)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    # Not JSON, treat as binary audio data
+                    pass
             
             # If it's "END_OF_AUDIO" marker
             if frame_data == b"END_OF_AUDIO":
@@ -1173,15 +1184,51 @@ class TranscriptionServer:
         try:
             message = json.loads(message_data)
             client = self.client_manager.get_client(websocket)
+            message_type = message.get("type")
             
-            # Handle speaker update messages
-            if message.get("type") == "speaker_update" and client:
+            if not client:
+                logging.warning(f"Received message '{message_type}' for unknown client")
+                return False
+            
+            # Handle speaker activity update messages (new advanced format)
+            if message_type == "speaker_activity_update":
+                logging.info(f"[Client {client.client_uid}] Received speaker_activity_update message")
+                try:
+                    # Convert speaker activity to SpeakerMeta objects
+                    speaker_meta_list = convert_speaker_activity_to_meta(message)
+                    
+                    if speaker_meta_list:
+                        # Add to client's speaker activity data
+                        client.speaker_activity_data.extend(speaker_meta_list)
+                        
+                        # Keep only recent data (last 60 seconds) 
+                        from datetime import timezone, timedelta
+                        cutoff_time = dt.now(timezone.utc) - timedelta(seconds=60)
+                        client.speaker_activity_data = [
+                            meta for meta in client.speaker_activity_data 
+                            if meta.timestamp > cutoff_time
+                        ]
+                        
+                        logging.info(f"[Client {client.client_uid}] Added {len(speaker_meta_list)} speaker meta entries. Buffer size: {len(client.speaker_activity_data)}")
+                    else:
+                        logging.warning(f"[Client {client.client_uid}] No valid speaker meta data extracted from activity update")
+                        
+                except Exception as e:
+                    logging.error(f"[Client {client.client_uid}] Error processing speaker_activity_update: {e}")
+                    
+                return True
+            
+            # Handle simple speaker update messages (legacy format)
+            elif message_type == "speaker_update":
                 speaker_id = message.get("speaker_id")
                 speaker_name = message.get("speaker_name")
                 client.update_speaker(speaker_id, speaker_name)
                 return True
             
-            return False  # Not a recognized message type
+            else:
+                logging.warning(f"Unknown message type: {message_type}")
+                return False
+                
         except json.JSONDecodeError:
             logging.error("Failed to decode JSON message")
             return False
@@ -1757,34 +1804,56 @@ class ServeClientTensorRT(ServeClientBase):
         try:
             message = json.loads(message_data)
             client = self.client_manager.get_client(websocket)
-            if not client:
-                logging.warning(f"No client found for websocket in process_websocket_message")
-                return False
-
             message_type = message.get("type")
             
-            # Handle speaker_activity_update messages
-            if message_type == "speaker_activity_update":
-                speaker_logger.info(f"Received speaker_activity_update for client {client.client_uid}. Payload: {message}")
-                new_speaker_metas = convert_speaker_activity_to_meta(message) # message is the full payload
-                if new_speaker_metas:
-                    # Potentially lock client.speaker_activity_data if updates can be frequent and concurrent with reads
-                    client.speaker_activity_data.extend(new_speaker_metas)
-                    speaker_logger.info(f"Added {len(new_speaker_metas)} SpeakerMeta entries for client {client.client_uid}. Total now: {len(client.speaker_activity_data)}")
-                return True # Message handled
+            if not client:
+                logging.warning(f"Received message '{message_type}' for unknown client")
+                return False
             
-            # Handle other message types if necessary
-            # elif message_type == "some_other_control_message":
-            #     # ... handle it ...
-            #     return True
-
-            speaker_logger.debug(f"Received unhandled JSON message type: {message_type} for client {client.client_uid}")
-            return False  # Not a recognized or handled message type here
+            # Handle speaker activity update messages (new advanced format)
+            if message_type == "speaker_activity_update":
+                logging.info(f"[Client {client.client_uid}] Received speaker_activity_update message")
+                try:
+                    # Convert speaker activity to SpeakerMeta objects
+                    speaker_meta_list = convert_speaker_activity_to_meta(message)
+                    
+                    if speaker_meta_list:
+                        # Add to client's speaker activity data
+                        client.speaker_activity_data.extend(speaker_meta_list)
+                        
+                        # Keep only recent data (last 60 seconds) 
+                        from datetime import timezone, timedelta
+                        cutoff_time = dt.now(timezone.utc) - timedelta(seconds=60)
+                        client.speaker_activity_data = [
+                            meta for meta in client.speaker_activity_data 
+                            if meta.timestamp > cutoff_time
+                        ]
+                        
+                        logging.info(f"[Client {client.client_uid}] Added {len(speaker_meta_list)} speaker meta entries. Buffer size: {len(client.speaker_activity_data)}")
+                    else:
+                        logging.warning(f"[Client {client.client_uid}] No valid speaker meta data extracted from activity update")
+                        
+                except Exception as e:
+                    logging.error(f"[Client {client.client_uid}] Error processing speaker_activity_update: {e}")
+                    
+                return True
+            
+            # Handle simple speaker update messages (legacy format)
+            elif message_type == "speaker_update":
+                speaker_id = message.get("speaker_id")
+                speaker_name = message.get("speaker_name")
+                client.update_speaker(speaker_id, speaker_name)
+                return True
+            
+            else:
+                logging.warning(f"Unknown message type: {message_type}")
+                return False
+                
         except json.JSONDecodeError:
-            logging.error("Failed to decode JSON message in process_websocket_message")
+            logging.error("Failed to decode JSON message")
             return False
         except Exception as e:
-            logging.error(f"Error processing WebSocket message in process_websocket_message: {e}", exc_info=True)
+            logging.error(f"Error processing WebSocket message: {e}")
             return False
 
 
