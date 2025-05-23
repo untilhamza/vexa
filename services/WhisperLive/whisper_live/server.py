@@ -44,11 +44,11 @@ LOG_DIR = "transcription_logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 log_filename = os.path.join(LOG_DIR, f"transcription_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 file_handler = logging.FileHandler(log_filename)
-file_handler.setLevel(logging.INFO)
+file_handler.setLevel(logging.DEBUG)  # Changed to DEBUG to see debug messages
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(file_formatter)
 logger = logging.getLogger("transcription")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)  # Changed to DEBUG to see debug messages
 logger.addHandler(file_handler)
 
 # Use the existing logger instance from the file for speaker matching related logs
@@ -69,7 +69,7 @@ class SpeakerMeta(BaseModel):
         """Create SpeakerMeta from client's speaker_activity_update payload item.
         
         Args:
-            speaker_payload: Dict containing 'id', 'name', 'mic_activity_bits'.
+            speaker_payload: Dict containing 'speaker_id', 'speaker_name', 'mic_activity_bits'.
             meeting_id: The meeting ID for this session.
             timestamp_override: The timestamp from the parent speaker_activity_update message.
                 
@@ -81,10 +81,10 @@ class SpeakerMeta(BaseModel):
             mic_level = sum(1 for c in meta if c == '1') / max(len(meta), 1) if meta else 0.0
             
             return cls(
-                name=speaker_payload['name'],
+                name=speaker_payload['speaker_name'],
                 mic_level=mic_level,
                 timestamp=timestamp_override,
-                user_id=speaker_payload['id'],
+                user_id=speaker_payload['speaker_id'],
                 meeting_id=meeting_id,
                 meta_bits=meta
             )
@@ -259,7 +259,10 @@ class TranscriptSpeakerMatcher:
         """
         activity_segments = []
         if not speaker_meta_list:
+            speaker_logger.debug("_create_speaker_activity_segments: No speaker meta list provided")
             return []
+
+        speaker_logger.debug(f"_create_speaker_activity_segments: Processing {len(speaker_meta_list)} speaker meta entries")
 
         sorted_meta = sorted(speaker_meta_list, key=lambda sm: (sm.timestamp, sm.user_id or ''))
 
@@ -269,8 +272,12 @@ class TranscriptSpeakerMatcher:
                 grouped_by_user[sm.user_id] = []
             grouped_by_user[sm.user_id].append(sm)
 
+        speaker_logger.debug(f"_create_speaker_activity_segments: Grouped into {len(grouped_by_user)} users: {list(grouped_by_user.keys())}")
+
         for user_id, metas in grouped_by_user.items():
             if not metas: continue
+            
+            speaker_logger.debug(f"Processing user {user_id} with {len(metas)} meta entries")
             
             speaker_name = metas[0].name
 
@@ -279,7 +286,10 @@ class TranscriptSpeakerMatcher:
             for sm_entry in metas:
                 meta_bits = sm_entry.meta_bits
                 entry_timestamp = sm_entry.timestamp
+                speaker_logger.debug(f"  Meta entry for {user_id}: timestamp={entry_timestamp.isoformat()}, meta_bits='{meta_bits}', mic_level={sm_entry.mic_level}")
+                
                 if not meta_bits:
+                    speaker_logger.debug(f"  Skipping entry with no meta_bits for {user_id}")
                     continue
 
                 num_bits = len(meta_bits)
@@ -289,8 +299,12 @@ class TranscriptSpeakerMatcher:
                         slot_start_time = entry_timestamp - timedelta(seconds=(num_bits - i) * 0.1)
                         slot_end_time = entry_timestamp - timedelta(seconds=(num_bits - i - 1) * 0.1)
                         active_sub_segments.append((slot_start_time, slot_end_time))
+                        speaker_logger.debug(f"    Found active bit at position {i}: {slot_start_time.isoformat()} to {slot_end_time.isoformat()}")
+            
+            speaker_logger.debug(f"  User {user_id} has {len(active_sub_segments)} active sub-segments")
             
             if not active_sub_segments:
+                speaker_logger.debug(f"  No active sub-segments for user {user_id}, skipping")
                 continue
 
             active_sub_segments.sort(key=lambda x: x[0])
@@ -320,6 +334,7 @@ class TranscriptSpeakerMatcher:
                 avg_mic_level=1.0
             ))
             activity_segments.extend(merged_segments_for_user)
+            speaker_logger.debug(f"  Created {len(merged_segments_for_user)} merged segments for user {user_id} ({speaker_name})")
             
         activity_segments.sort(key=lambda s: s.start_time)
         speaker_logger.debug(f"Created {len(activity_segments)} speaker activity segments from raw meta data.")
@@ -336,19 +351,35 @@ class TranscriptSpeakerMatcher:
         Returns:
             List of transcript segments with matched speaker_name and speaker_id.
         """
+        speaker_logger.debug(f"Matcher called with {len(speaker_meta_data)} speaker_meta entries and {len(transcription_segments)} transcription segments")
+        
         if not speaker_meta_data or not transcription_segments:
-            speaker_logger.info("Matcher: No speaker data or transcription segments to match.")
+            speaker_logger.info(f"Matcher: No speaker data ({len(speaker_meta_data)} entries) or transcription segments ({len(transcription_segments)} segments) to match.")
             return transcription_segments
+        
+        # Debug: Log the speaker meta data we have
+        speaker_logger.debug(f"Speaker meta data timestamps: {[meta.timestamp.isoformat() for meta in speaker_meta_data[:5]]}")  # First 5 entries
+        speaker_logger.debug(f"Transcription segments: {[(seg.start_timestamp, seg.end_timestamp, seg.content[:20]) for seg in transcription_segments[:3]]}")  # First 3 segments
         
         speaker_activity_periods = self._create_speaker_activity_segments(speaker_meta_data)
 
         if not speaker_activity_periods:
             speaker_logger.info("Matcher: No consolidated speaker activity periods created.")
+            speaker_logger.debug(f"Debug: Input speaker meta had {len(speaker_meta_data)} entries but created 0 activity periods")
+            # Debug: Check if speaker meta has activity bits
+            for i, meta in enumerate(speaker_meta_data[:3]):  # Check first 3
+                speaker_logger.debug(f"Meta {i}: name={meta.name}, user_id={meta.user_id}, mic_level={meta.mic_level}, meta_bits={meta.meta_bits}")
             return transcription_segments
+
+        speaker_logger.debug(f"Created {len(speaker_activity_periods)} speaker activity periods for matching")
+        for i, period in enumerate(speaker_activity_periods[:3]):  # First 3 periods
+            speaker_logger.debug(f"Activity period {i}: {period.speaker_name} ({period.speaker_id}) from {period.start_time.isoformat()} to {period.end_time.isoformat()}")
 
         for ts_segment in transcription_segments:
             abs_segment_start = self.t0 + timedelta(seconds=ts_segment.start_timestamp)
             abs_segment_end = self.t0 + timedelta(seconds=ts_segment.end_timestamp)
+            
+            speaker_logger.debug(f"Matching segment '{ts_segment.content[:20]}' from {abs_segment_start.isoformat()} to {abs_segment_end.isoformat()}")
             
             segment_duration_td = abs_segment_end - abs_segment_start
             if segment_duration_td.total_seconds() <= 0:
@@ -372,16 +403,21 @@ class TranscriptSpeakerMatcher:
                         "mic_level": active_period.avg_mic_level
                     })
             
+            speaker_logger.debug(f"Found {len(possible_matches)} possible matches for segment '{ts_segment.content[:20]}'")
+            
             if possible_matches:
                 possible_matches.sort(key=lambda m: m["overlap_ratio"], reverse=True)
                 
                 best_match = possible_matches[0]
                 
-                if best_match["overlap_ratio"] > 0.5: 
+                speaker_logger.debug(f"Best match for '{ts_segment.content[:20]}': {best_match['speaker_name']} with overlap {best_match['overlap_ratio']:.2f}")
+                
+                if best_match["overlap_ratio"] > 0.1:  # Lowered from 0.5 to 0.1 for more realistic matching
                     ts_segment.speaker = best_match["speaker_name"]
                     ts_segment.speaker_id = best_match["speaker_id"]
-                # else:
-                    # speaker_logger.debug(f"    No significant match for '{ts_segment.content[:20]}'. Best overlap: {best_match['speaker_name']} ({best_match['overlap_ratio']:.2f})")
+                    speaker_logger.debug(f"Assigned speaker {best_match['speaker_name']} to segment '{ts_segment.content[:20]}'")
+                else:
+                    speaker_logger.debug(f"No significant match for '{ts_segment.content[:20]}'. Best overlap: {best_match['speaker_name']} ({best_match['overlap_ratio']:.2f})")
 
         return transcription_segments
 
