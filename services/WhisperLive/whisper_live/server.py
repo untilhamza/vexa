@@ -412,7 +412,7 @@ class TranscriptSpeakerMatcher:
                 
                 speaker_logger.debug(f"Best match for '{ts_segment.content[:20]}': {best_match['speaker_name']} with overlap {best_match['overlap_ratio']:.2f}")
                 
-                if best_match["overlap_ratio"] > 0.1:  # Lowered from 0.5 to 0.1 for more realistic matching
+                if best_match["overlap_ratio"] > 0.02:  # Lowered from 0.05 to 0.02 for longer segments
                     ts_segment.speaker = best_match["speaker_name"]
                     ts_segment.speaker_id = best_match["speaker_id"]
                     speaker_logger.debug(f"Assigned speaker {best_match['speaker_name']} to segment '{ts_segment.content[:20]}'")
