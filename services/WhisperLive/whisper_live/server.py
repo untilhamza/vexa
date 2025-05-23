@@ -418,6 +418,22 @@ class TranscriptSpeakerMatcher:
                     speaker_logger.debug(f"Assigned speaker {best_match['speaker_name']} to segment '{ts_segment.content[:20]}'")
                 else:
                     speaker_logger.debug(f"No significant match for '{ts_segment.content[:20]}'. Best overlap: {best_match['speaker_name']} ({best_match['overlap_ratio']:.2f})")
+        
+        # Fallback logic: If only one speaker has any activity, assign unmatched segments to that speaker
+        if speaker_activity_periods:
+            unique_speakers = set((period.speaker_name, period.speaker_id) for period in speaker_activity_periods)
+            if len(unique_speakers) == 1:
+                fallback_speaker_name, fallback_speaker_id = next(iter(unique_speakers))
+                unassigned_count = 0
+                for ts_segment in transcription_segments:
+                    if ts_segment.speaker is None:
+                        ts_segment.speaker = fallback_speaker_name
+                        ts_segment.speaker_id = fallback_speaker_id
+                        unassigned_count += 1
+                        speaker_logger.debug(f"Fallback: Assigned '{ts_segment.content[:20]}' to {fallback_speaker_name} (only active speaker)")
+                
+                if unassigned_count > 0:
+                    speaker_logger.info(f"Fallback logic: Assigned {unassigned_count} unmatched segments to {fallback_speaker_name} (only active speaker)")
 
         return transcription_segments
 
