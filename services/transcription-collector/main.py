@@ -247,6 +247,16 @@ async def process_stream_message(message_id: str, message_data: Dict[str, Any]) 
         else:
             logger.info(f"[Msg {message_id}/Meet {internal_meeting_id}] Processing segments without speaker info.")
 
+        # Get speaker information from stream data if available
+        speaker_id = stream_data.get('speaker_id')
+        speaker_name = stream_data.get('speaker_name')
+        
+        # Log if we have speaker info
+        if speaker_id or speaker_name:
+            logger.info(f"[Msg {message_id}/Meet {internal_meeting_id}] Processing segments with speaker info: ID={speaker_id}, Name={speaker_name}")
+        else:
+            logger.info(f"[Msg {message_id}/Meet {internal_meeting_id}] Processing segments without speaker info.")
+
         # 4. Prepare segments for Redis Hash storage
         segment_count = 0
         hash_key = f"meeting:{internal_meeting_id}:segments"
@@ -274,6 +284,10 @@ async def process_stream_message(message_id: str, message_data: Dict[str, Any]) 
                  logger.warning(f"[Msg {message_id}/Meet {internal_meeting_id}] Skipping segment {i} with invalid time format: {time_err} - Segment: {segment}")
                  continue
                         
+             # Get speaker_id and speaker_name from the individual segment dictionary
+             segment_speaker_id = segment.get('speaker_id')
+             segment_speaker_name = segment.get('speaker_name')
+
              # Create data for Redis Hash
              start_time_key = f"{start_time_float:.3f}"
              session_uid_from_payload = stream_data.get('uid') # Get uid from message payload
@@ -702,7 +716,6 @@ async def process_redis_to_postgres():
                                             text=segment_data['text'],
                                             language=segment_data.get('language'),
                                             session_uid=segment_session_uid, # Pass session_uid
-                                            speaker_id=segment_data.get('speaker_id'),  # Pass speaker_id 
                                             speaker_name=segment_data.get('speaker_name')  # Pass speaker_name
                                         )
                                         batch_to_store.append(new_transcription)
@@ -751,7 +764,7 @@ async def process_redis_to_postgres():
 # --- Helper Functions ---
 
 # Simplified function - assumes meeting_id is valid
-def create_transcription_object(meeting_id: int, start: float, end: float, text: str, language: Optional[str], session_uid: Optional[str], speaker_id: Optional[str] = None, speaker_name: Optional[str] = None) -> Transcription:
+def create_transcription_object(meeting_id: int, start: float, end: float, text: str, language: Optional[str], session_uid: Optional[str], speaker_name: Optional[str] = None) -> Transcription:
     """Creates a Transcription ORM object without adding/committing."""
     return Transcription(
         meeting_id=meeting_id,
@@ -760,8 +773,7 @@ def create_transcription_object(meeting_id: int, start: float, end: float, text:
         text=text,
         language=language,
         session_uid=session_uid, # Add session_uid
-        speaker_id=speaker_id,  # Add speaker_id 
-        speaker_name=speaker_name,  # Add speaker_name
+        speaker=speaker_name,  # Assign speaker_name to the 'speaker' field
         created_at=datetime.utcnow() # Record creation time in DB
     )
 

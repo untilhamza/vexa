@@ -209,6 +209,24 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
       };
       // --- --------------------------------------------------------- ---
 
+      // Global cleanup function to prevent memory leaks
+      let cleanupFunctions: (() => void)[] = [];
+      const addCleanupFunction = (fn: () => void) => {
+        cleanupFunctions.push(fn);
+      };
+
+      const performGlobalCleanup = () => {
+        (window as any).logBot("Performing global cleanup...");
+        cleanupFunctions.forEach((fn) => {
+          try {
+            fn();
+          } catch (err) {
+            console.error("Error during cleanup:", err);
+          }
+        });
+        cleanupFunctions = [];
+      };
+
       await new Promise<void>((resolve, reject) => {
         try {
           (window as any).logBot("Starting recording process.");
@@ -230,6 +248,13 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
           const audioContext = new AudioContext();
           const destinationNode = audioContext.createMediaStreamDestination();
           let sourcesConnected = 0;
+
+          // Add audio context to cleanup
+          addCleanupFunction(() => {
+            if (audioContext.state !== "closed") {
+              audioContext.close();
+            }
+          });
 
           // NEW: Connect all media elements to the destination node
           mediaElements.forEach((element: any, index: number) => {
@@ -281,11 +306,6 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
           );
           // --- ------------------------------------------------------------------------ ---
 
-          // --- ADDED: Add secondary leave button selector for confirmation ---
-          const secondaryLeaveButtonSelector = `//button[.//span[text()='Leave meeting']] | //button[.//span[text()='Just leave the meeting']]`; // Example, adjust based on actual UI
-          // --- ----------------------------------------------------------- ---
-
-          // const wsUrl = "ws://whisperlive:9090";
           const wsUrl = whisperUrlForBrowser;
           if (!wsUrl) {
             (window as any).logBot?.(
@@ -294,9 +314,8 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
             console.error(
               "CRITICAL: WhisperLive WebSocket URL is missing in browser context!"
             );
-            return;
+            return reject(new Error("WhisperLive WebSocket URL is missing"));
           }
-          // (window as any).logBot(`Attempting to connect WebSocket to: ${wsUrl} with platform: ${platform}, session UID: ${sessionUid}`); // Log the correct UID
 
           // --- ADD Browser-scope state for current WS config ---
           let currentWsLanguage = initialLanguage;
@@ -360,42 +379,42 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                   socket.send(jsonPayload);
 
                   // --- MODIFIED: Start new advanced speaker monitoring ---
-                  startAdvancedSpeakerMonitoring();
+                  startAdvancedSpeakerMonitoring(); // Re-enabled advanced speaker monitoring
                   // --- ------------------------------------------------- ---
                 }
               };
 
               socket.onmessage = (event) => {
-                (window as any).logBot("Received message: " + event.data);
-                const data = JSON.parse(event.data);
-                // NOTE: The check `if (data["uid"] !== sessionUid) return;` is removed
-                // because we no longer have a single sessionUid for the lifetime of the evaluate block.
-                // Each message *should* contain the UID associated with the specific WebSocket
-                // connection it came from. Downstream needs to handle this if correlation is needed.
-                // For now, we assume messages are relevant to the current bot context.
-                // Consider re-introducing a check if whisperlive echoes back the UID and it's needed.
+                try {
+                  (window as any).logBot("Received message: " + event.data);
+                  const data = JSON.parse(event.data);
 
-                if (data["status"] === "ERROR") {
-                  (window as any).logBot(
-                    `WebSocket Server Error: ${data["message"]}`
-                  );
-                } else if (data["status"] === "WAIT") {
-                  (window as any).logBot(`Server busy: ${data["message"]}`);
-                } else if (!isServerReady) {
-                  isServerReady = true;
-                  (window as any).logBot("Server is ready.");
-                } else if (data["language"]) {
-                  (window as any).logBot(
-                    `Language detected: ${data["language"]}`
-                  );
-                } else if (data["message"] === "DISCONNECT") {
-                  (window as any).logBot("Server requested disconnect.");
-                  if (socket) {
-                    socket.close();
+                  if (data["status"] === "ERROR") {
+                    (window as any).logBot(
+                      `WebSocket Server Error: ${data["message"]}`
+                    );
+                  } else if (data["status"] === "WAIT") {
+                    (window as any).logBot(`Server busy: ${data["message"]}`);
+                  } else if (!isServerReady) {
+                    isServerReady = true;
+                    (window as any).logBot("Server is ready.");
+                  } else if (data["language"]) {
+                    (window as any).logBot(
+                      `Language detected: ${data["language"]}`
+                    );
+                  } else if (data["message"] === "DISCONNECT") {
+                    (window as any).logBot("Server requested disconnect.");
+                    if (socket) {
+                      socket.close();
+                    }
+                  } else {
+                    (window as any).logBot(
+                      `Transcription: ${JSON.stringify(data)}`
+                    );
                   }
-                } else {
+                } catch (err: any) {
                   (window as any).logBot(
-                    `Transcription: ${JSON.stringify(data)}`
+                    `Error parsing WebSocket message: ${err.message}`
                   );
                 }
               };
@@ -410,6 +429,14 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                 (window as any).logBot(
                   `WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason}`
                 );
+
+                isServerReady = false; // Reset server ready state
+
+                // Clean up intervals when socket closes
+                if (micPollingInterval) {
+                  clearInterval(micPollingInterval);
+                  micPollingInterval = null;
+                }
 
                 // Retry logic
                 if (retryCount < maxRetries) {
@@ -429,9 +456,21 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                   (window as any).logBot(
                     "Maximum WebSocket reconnection attempts reached. Giving up."
                   );
-                  // Optionally, we could reject the promise here if required
+                  performGlobalCleanup();
+                  reject(
+                    new Error(
+                      "WebSocket connection failed after maximum retries"
+                    )
+                  );
                 }
               };
+
+              // Add socket cleanup
+              addCleanupFunction(() => {
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                  socket.close();
+                }
+              });
             } catch (e: any) {
               (window as any).logBot(`Error creating WebSocket: ${e.message}`);
               // For initial connection errors, handle with retry logic
@@ -449,6 +488,7 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                   setupWebSocket();
                 }, exponentialDelay);
               } else {
+                performGlobalCleanup();
                 return reject(
                   new Error(
                     `WebSocket creation failed after ${maxRetries} attempts: ${e.message}`
@@ -487,10 +527,7 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
               (window as any).logBot(
                 "[Node->Browser] Socket is null or closed. Attempting to setupWebSocket directly."
               );
-              // Directly calling setupWebSocket might cause issues if the old one is mid-retry
-              // Relying on the existing retry logic in onclose is likely safer.
-              // If setupWebSocket is called here, ensure it handles potential double connections.
-              // setupWebSocket();
+              setupWebSocket();
             }
           };
           // --- ----------------------------------------------------------- ---
@@ -501,19 +538,26 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
               "Attempting to leave the meeting from browser context..."
             );
             try {
-              // *** FIXED: Use document.evaluate for XPath ***
-              const primaryLeaveButtonXpath = `//button[@aria-label="Leave call"]`;
-              const secondaryLeaveButtonXpath = `//button[.//span[text()='Leave meeting']] | //button[.//span[text()='Just leave the meeting']]`;
+              // Updated selectors to be more robust
+              const primaryLeaveButtonXpath = `//button[@aria-label="Leave call" or @aria-label="End call"]`;
+              const secondaryLeaveButtonXpath = `//button[contains(.,"Leave") or contains(.,"End call") or contains(.,"Exit")]`;
 
               const getElementByXpath = (path: string): HTMLElement | null => {
-                const result = document.evaluate(
-                  path,
-                  document,
-                  null,
-                  XPathResult.FIRST_ORDERED_NODE_TYPE,
-                  null
-                );
-                return result.singleNodeValue as HTMLElement | null;
+                try {
+                  const result = document.evaluate(
+                    path,
+                    document,
+                    null,
+                    XPathResult.FIRST_ORDERED_NODE_TYPE,
+                    null
+                  );
+                  return result.singleNodeValue as HTMLElement | null;
+                } catch (err: any) {
+                  (window as any).logBot(
+                    `Error evaluating XPath ${path}: ${err.message}`
+                  );
+                  return null;
+                }
               };
 
               const primaryLeaveButton = getElementByXpath(
@@ -521,7 +565,7 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
               );
               if (primaryLeaveButton) {
                 (window as any).logBot("Clicking primary leave button...");
-                primaryLeaveButton.click(); // No need to cast HTMLElement if getElementByXpath returns it
+                primaryLeaveButton.click();
                 await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait a bit for potential confirmation dialog
 
                 // Try clicking secondary/confirmation button if it appears
@@ -538,6 +582,7 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                   (window as any).logBot("Secondary leave button not found.");
                 }
                 (window as any).logBot("Leave sequence completed.");
+                performGlobalCleanup(); // Clean up before leaving
                 return true; // Indicate leave attempt was made
               } else {
                 (window as any).logBot("Primary leave button not found.");
@@ -556,10 +601,21 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
 
           // FIXED: Revert to original audio processing that works with whisperlive
           // but use our combined stream as the input source
-          const audioDataCache = [];
           const context = new AudioContext();
           const mediaStream = context.createMediaStreamSource(stream); // Use our combined stream
           const recorder = context.createScriptProcessor(4096, 1, 1);
+
+          // Add recorder cleanup
+          addCleanupFunction(() => {
+            try {
+              recorder.disconnect();
+              if (context.state !== "closed") {
+                context.close();
+              }
+            } catch (err) {
+              console.error("Error cleaning up audio context:", err);
+            }
+          });
 
           recorder.onaudioprocess = async (event) => {
             // Check if server is ready AND socket is open
@@ -568,7 +624,6 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
               !socket ||
               socket.readyState !== WebSocket.OPEN
             ) {
-              // (window as any).logBot("WS not ready or closed, skipping audio data send."); // Optional debug log
               return;
             }
             const inputData = event.inputBuffer.getChannelData(0);
@@ -606,52 +661,65 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
             "Audio processing pipeline connected and sending data."
           );
 
-          // Click the "People" button
-          const peopleButton = document.querySelector(
-            'button[aria-label^="People"]'
-          );
-          if (!peopleButton) {
-            recorder.disconnect();
-            return reject(
-              new Error(
-                "[BOT Inner Error] 'People' button not found. Update the selector."
-              )
-            );
+          // Click the "People" button with better error handling
+          const peopleButtonSelectors = [
+            'button[aria-label^="People"]',
+            'button[aria-label="People"]',
+            'button[data-panel-id="1"]',
+          ];
+
+          let peopleButton: Element | null = null;
+          for (const selector of peopleButtonSelectors) {
+            peopleButton = document.querySelector(selector);
+            if (peopleButton) break;
           }
-          (peopleButton as HTMLElement).click();
+
+          if (!peopleButton) {
+            (window as any).logBot(
+              "Warning: People button not found using any selector. Speaker detection may not work."
+            );
+          } else {
+            (peopleButton as HTMLElement).click();
+          }
 
           // Monitor participant list every 5 seconds
           let aloneTime = 0;
           const checkInterval = setInterval(() => {
-            const peopleList = document.querySelector('[role="list"]');
-            if (!peopleList) {
-              (window as any).logBot(
-                "Participant list not found; assuming meeting ended."
-              );
-              clearInterval(checkInterval);
-              recorder.disconnect();
-              resolve();
-              return;
-            }
-            const count = peopleList.childElementCount;
-            (window as any).logBot("Participant count: " + count);
+            try {
+              const peopleList = document.querySelector('[role="list"]');
+              if (!peopleList) {
+                (window as any).logBot(
+                  "Participant list not found; assuming meeting ended."
+                );
+                clearInterval(checkInterval);
+                performGlobalCleanup();
+                resolve();
+                return;
+              }
+              const count = peopleList.childElementCount;
+              (window as any).logBot("Participant count: " + count);
 
-            if (count <= 1) {
-              aloneTime += 5;
-              (window as any).logBot(
-                "Bot appears alone for " + aloneTime + " seconds..."
-              );
-            } else {
-              aloneTime = 0;
-            }
+              if (count <= 1) {
+                aloneTime += 5;
+                (window as any).logBot(
+                  "Bot appears alone for " + aloneTime + " seconds..."
+                );
+              } else {
+                aloneTime = 0;
+              }
 
-            if (aloneTime >= 10 || count === 0) {
+              if (aloneTime >= 10 || count === 0) {
+                (window as any).logBot(
+                  "Meeting ended or bot alone for too long. Stopping recorder..."
+                );
+                clearInterval(checkInterval);
+                performGlobalCleanup();
+                resolve();
+              }
+            } catch (err: any) {
               (window as any).logBot(
-                "Meeting ended or bot alone for too long. Stopping recorder..."
+                `Error in participant check: ${err.message}`
               );
-              clearInterval(checkInterval);
-              recorder.disconnect();
-              resolve();
             }
           }, 5000);
 
@@ -668,7 +736,17 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
             recorder.disconnect();
             resolve();
           });
-          document.addEventListener("visibilitychange", () => {
+
+          // Listen for unload and visibility changes
+          const handleUnload = () => {
+            (window as any).logBot(
+              "Page is unloading. Stopping recorder and speaker detection..."
+            );
+            performGlobalCleanup();
+            resolve();
+          };
+
+          const handleVisibilityChange = () => {
             if (document.visibilityState === "hidden") {
               (window as any).logBot(
                 "Document is hidden. Stopping recorder..."
@@ -681,6 +759,18 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
               recorder.disconnect();
               resolve();
             }
+          };
+
+          window.addEventListener("beforeunload", handleUnload);
+          document.addEventListener("visibilitychange", handleVisibilityChange);
+
+          // Add event listener cleanup
+          addCleanupFunction(() => {
+            window.removeEventListener("beforeunload", handleUnload);
+            document.removeEventListener(
+              "visibilitychange",
+              handleVisibilityChange
+            );
           });
 
           // --- ADDED: New Advanced Speaker Monitoring Function ---
@@ -723,188 +813,190 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
             };
 
             micPollingInterval = setInterval(async () => {
-              if (
-                !socket ||
-                socket.readyState !== WebSocket.OPEN ||
-                !isServerReady
-              ) {
-                (window as any).logBot(
-                  "AdvancedSpeakerMonitoring: WS not ready or closed, skipping cycle."
-                );
-                return;
-              }
+              try {
+                if (
+                  !socket ||
+                  socket.readyState !== WebSocket.OPEN ||
+                  !isServerReady
+                ) {
+                  // (window as any).logBot( // Optional: this log can be very noisy
+                  //   "AdvancedSpeakerMonitoring: WS not ready or closed, skipping cycle."
+                  // );
+                  return;
+                }
 
-              nodeRefreshCounter++;
-              sendDataCounter++;
+                nodeRefreshCounter++;
+                sendDataCounter++;
 
-              // Refresh participant nodes and call name every 50 cycles (50 * 100ms = 5 seconds)
-              if (nodeRefreshCounter % 50 === 1) {
-                if (!(await ensurePeoplePanelOpen())) {
-                  (window as any).logBot(
-                    "AdvancedSpeakerMonitoring: Cannot ensure people panel is open. Skipping node refresh."
-                  );
-                  // Potentially stop or retry opening panel later
-                } else {
-                  participantNodes = [];
-                  callName =
-                    (
-                      document.querySelector(
-                        "[jscontroller=yEvoid]"
-                      ) as HTMLDivElement | null
-                    )?.innerText?.trim() || "Unknown Call";
-
-                  const participantElements = Array.from(
-                    document.querySelectorAll(
-                      'div[role="listitem"][data-participant-id]'
-                    )
-                  ) as HTMLElement[];
-
-                  (window as any).logBot(
-                    `AdvancedSpeakerMonitoring: Found ${participantElements.length} participant elements.`
-                  );
-
-                  participantElements.forEach((el: HTMLElement) => {
-                    const participantId = el.getAttribute(
-                      "data-participant-id"
+                // Refresh participant nodes and call name every 50 cycles (50 * 50ms = 2.5 seconds)
+                if (nodeRefreshCounter % 50 === 1) {
+                  if (!(await ensurePeoplePanelOpen())) {
+                    (window as any).logBot(
+                      "AdvancedSpeakerMonitoring: Cannot ensure people panel is open. Skipping node refresh."
                     );
-                    if (!participantId) return;
+                    // Potentially stop or retry opening panel later
+                  } else {
+                    participantNodes = [];
+                    callName =
+                      (
+                        document.querySelector(
+                          "[jscontroller=yEvoid]"
+                        ) as HTMLDivElement | null
+                      )?.innerText?.trim() || "Unknown Call";
 
-                    let nameNode = el.querySelector(
-                      "[data-self-name]"
-                    ) as HTMLElement;
-                    if (!nameNode) {
-                      // Fallback selector, adjust if needed based on actual Google Meet DOM for participant names
-                      nameNode = el.querySelector("span.zWGUib") as HTMLElement; // Common selector for name
-                    }
-                    // More robust name extraction, trying different common selectors
-                    let name = "Unknown Participant";
-                    if (nameNode) {
-                      name =
-                        nameNode.innerText?.split("\n").pop()?.trim() ||
-                        `Participant ${participantId}`;
-                    } else {
-                      // Try another common selector if the first one fails
-                      const secondaryNameNode = el.querySelector(
-                        ".cS7aqe.N2K3jd"
-                      ) as HTMLElement; // Another possible name element
-                      if (secondaryNameNode) {
+                    const participantElements = Array.from(
+                      document.querySelectorAll(
+                        'div[role="listitem"][data-participant-id]'
+                      )
+                    ) as HTMLElement[];
+
+                    (window as any).logBot(
+                      `AdvancedSpeakerMonitoring: Found ${participantElements.length} participant elements.`
+                    );
+
+                    participantElements.forEach((el: HTMLElement) => {
+                      const participantId = el.getAttribute(
+                        "data-participant-id"
+                      );
+                      if (!participantId) return;
+
+                      let nameNode = el.querySelector(
+                        "[data-self-name]"
+                      ) as HTMLElement;
+                      if (!nameNode) {
+                        // Fallback selector, adjust if needed based on actual Google Meet DOM for participant names
+                        nameNode = el.querySelector(
+                          "span.zWGUib"
+                        ) as HTMLElement; // Common selector for name
+                      }
+                      // More robust name extraction, trying different common selectors
+                      let name = "Unknown Participant";
+                      if (nameNode) {
                         name =
-                          secondaryNameNode.innerText?.trim() ||
+                          nameNode.innerText?.split("\n").pop()?.trim() ||
                           `Participant ${participantId}`;
                       } else {
+                        // Try another common selector if the first one fails
+                        const secondaryNameNode = el.querySelector(
+                          ".cS7aqe.N2K3jd"
+                        ) as HTMLElement; // Another possible name element
+                        if (secondaryNameNode) {
+                          name =
+                            secondaryNameNode.innerText?.trim() ||
+                            `Participant ${participantId}`;
+                        } else {
+                          (window as any).logBot(
+                            `AdvancedSpeakerMonitoring: Name node not found for participant ${participantId}. Using default.`
+                          );
+                        }
+                      }
+
+                      const micNode = el.querySelector(
+                        'div[jscontroller="ES310d"]'
+                      ) as HTMLElement; // Google's mic status container
+
+                      if (micNode && name) {
+                        // Ensure micNode and name are found
+                        participantNodes.push({
+                          id: participantId,
+                          name: name,
+                          el: el,
+                          micNode: micNode,
+                          micActivity: [],
+                        });
+                      } else {
                         (window as any).logBot(
-                          `AdvancedSpeakerMonitoring: Name node not found for participant ${participantId}. Using default.`
+                          `AdvancedSpeakerMonitoring: Skipping participant ${participantId} due to missing mic or name node.`
                         );
                       }
-                    }
+                    });
+                    (window as any).logBot(
+                      `AdvancedSpeakerMonitoring: Refreshed ${participantNodes.length} participant nodes. Call Name: ${callName}`
+                    );
+                  }
+                }
 
-                    const micNode = el.querySelector(
-                      'div[jscontroller="ES310d"]'
-                    ) as HTMLElement; // Google's mic status container
+                // Record mic activity for each participant
+                participantNodes.forEach((node) => {
+                  if (node && node.micNode) {
+                    const isSpeaking = node.micNode.classList.contains("HX2H7");
+                    node.micActivity.push(isSpeaking ? "1" : "0");
+                  }
+                });
 
-                    if (micNode && name) {
-                      // Ensure micNode and name are found
-                      participantNodes.push({
-                        id: participantId,
-                        name: name,
-                        el: el,
-                        micNode: micNode,
-                        micActivity: [],
-                      });
-                    } else {
+                // Send data every 10 cycles (10 * 50ms = 0.5 seconds)
+                if (sendDataCounter % 10 === 0) {
+                  if (
+                    socket &&
+                    socket.readyState === WebSocket.OPEN &&
+                    isServerReady &&
+                    participantNodes.length > 0
+                  ) {
+                    const timestamp = new Date().toISOString();
+                    const payload = {
+                      type: "speaker_activity_update",
+                      uid: (window as any).currentWsUid || generateUUID(),
+                      meeting_id: nativeMeetingId,
+                      call_name: callName,
+                      timestamp: timestamp,
+                      speakers: participantNodes.map((p) => ({
+                        speaker_id: p.id,
+                        speaker_name: p.name,
+                        mic_activity_bits: p.micActivity.join(""),
+                      })),
+                    };
+                    let payloadStr;
+                    try {
+                      payloadStr = JSON.stringify(payload);
+                    } catch (stringifyError: any) {
                       (window as any).logBot(
-                        `AdvancedSpeakerMonitoring: Skipping participant ${participantId} due to missing mic or name node.`
+                        `AdvancedSpeakerMonitoring: ERROR stringifying payload: ${stringifyError.message}`
                       );
+                      return; // Don't proceed if payload is bad
                     }
-                  });
-                  (window as any).logBot(
-                    `AdvancedSpeakerMonitoring: Refreshed ${participantNodes.length} participant nodes. Call Name: ${callName}`
-                  );
+                    (window as any).logBot(
+                      `AdvancedSpeakerMonitoring: Sending speaker activity payload: ${payloadStr}`
+                    );
+                    socket.send(payloadStr);
+                    (window as any).logBot(
+                      `AdvancedSpeakerMonitoring: Sent speaker activity update. Participants: ${payload.speakers.length}`
+                    );
+
+                    participantNodes.forEach((p) => (p.micActivity = []));
+                  } else if (
+                    participantNodes.length === 0 &&
+                    nodeRefreshCounter > 50
+                  ) {
+                    (window as any).logBot(
+                      "AdvancedSpeakerMonitoring: No participant nodes to send data for, or socket not ready."
+                    );
+                  }
                 }
+              } catch (error: any) {
+                (window as any).logBot(
+                  `AdvancedSpeakerMonitoring: Interval CRITICAL ERROR: ${
+                    error.message
+                  }${error.stack ? "\nStack: " + error.stack : ""}`
+                );
+                // Optional: To prevent repeated errors, though this might hide the root cause.
+                // if (micPollingInterval) {
+                //   clearInterval(micPollingInterval);
+                //   micPollingInterval = null;
+                //   (window as any).logBot("AdvancedSpeakerMonitoring: Cleared interval due to critical error.");
+                // }
               }
-
-              // Record mic activity for each participant
-              participantNodes.forEach((node) => {
-                if (node && node.micNode) {
-                  // Google Meet uses class "HX2H7" on the mic status div when mic is active/speaking
-                  // It might use "Rs7Ywc" or other classes for muted/off.
-                  // We're interested if "HX2H7" (speaking indicator) is present.
-                  // The example uses "gjg47c", which might be from a different context or an older version.
-                  // For Google Meet, "HX2H7" is a more reliable indicator of voice activity.
-                  const isSpeaking = node.micNode.classList.contains("HX2H7");
-                  node.micActivity.push(isSpeaking ? "1" : "0");
-                }
-              });
-
-              // Send data every 10 cycles (10 * 100ms = 1 second)
-              if (sendDataCounter % 10 === 0) {
-                if (
-                  socket &&
-                  socket.readyState === WebSocket.OPEN &&
-                  isServerReady &&
-                  participantNodes.length > 0
-                ) {
-                  const timestamp = new Date().toISOString();
-                  const payload = {
-                    type: "speaker_activity_update", // New type for this data
-                    uid: (window as any).currentWsUid || generateUUID(), // Use the current WebSocket session UID
-                    meeting_id: nativeMeetingId, // From botConfigData
-                    call_name: callName,
-                    timestamp: timestamp,
-                    speakers: participantNodes.map((p) => ({
-                      id: p.id,
-                      name: p.name,
-                      mic_activity_bits: p.micActivity.join(""),
-                    })),
-                  };
-                  socket.send(JSON.stringify(payload));
-                  (window as any).logBot(
-                    `AdvancedSpeakerMonitoring: Sent speaker activity update. Participants: ${payload.speakers.length}`
-                  );
-
-                  // Reset mic activity for the next interval
-                  participantNodes.forEach((p) => (p.micActivity = []));
-                } else if (
-                  participantNodes.length === 0 &&
-                  nodeRefreshCounter > 50
-                ) {
-                  // Only log if we've attempted a refresh
-                  (window as any).logBot(
-                    "AdvancedSpeakerMonitoring: No participant nodes to send data for, or socket not ready."
-                  );
-                }
-              }
-            }, 100); // Poll every 100ms
+            }, 50); // Poll every 50ms
           };
           // --- END OF New Advanced Speaker Monitoring Function ---
         } catch (error: any) {
+          performGlobalCleanup();
           return reject(new Error("[BOT Error] " + error.message));
         }
       });
     },
     { botConfigData: botConfig, whisperUrlForBrowser: whisperLiveUrlFromEnv }
-  ); // Pass arguments to page.evaluate
+  );
 };
-
-// Remove the compatibility shim 'recordMeeting' if no longer needed,
-// otherwise, ensure it constructs a valid BotConfig object.
-// Example if keeping:
-/*
-const recordMeeting = async (page: Page, meetingUrl: string, token: string, connectionId: string, platform: "google_meet" | "zoom" | "teams") => {
-  await prepareForRecording(page);
-  // Construct a minimal BotConfig - adjust defaults as needed
-  const dummyConfig: BotConfig = {
-      platform: platform,
-      meetingUrl: meetingUrl,
-      botName: "CompatibilityBot",
-      token: token,
-      connectionId: connectionId,
-      nativeMeetingId: "", // Might need to derive this if possible
-      automaticLeave: { waitingRoomTimeout: 300000, noOneJoinedTimeout: 300000, everyoneLeftTimeout: 300000 },
-  };
-  await startRecording(page, dummyConfig);
-};
-*/
 
 // --- ADDED: Exported function to trigger leave from Node.js ---
 export async function leaveGoogleMeet(page: Page): Promise<boolean> {
@@ -929,7 +1021,7 @@ export async function leaveGoogleMeet(page: Page): Promise<boolean> {
       }
     });
     log(`[leaveGoogleMeet] Browser leave action result: ${result}`);
-    return result; // Return true if leave was attempted, false otherwise
+    return result;
   } catch (error: any) {
     log(
       `[leaveGoogleMeet] Error calling performLeaveAction in browser: ${error.message}`

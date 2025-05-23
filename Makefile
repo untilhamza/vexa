@@ -78,27 +78,38 @@ build-bot-image:
 
 # Build Docker Compose service images
 build:
+ifndef TARGET
+	$(info TARGET not set for 'build'. Defaulting to cpu.)
+	$(eval TARGET := cpu)
+endif
 	@echo "---> Building Docker Compose services..."
 	@if [ "$(TARGET)" = "cpu" ]; then \
 		echo "---> Building with 'cpu' profile (includes whisperlive-cpu)..."; \
 		docker compose --profile cpu build; \
+	elif [ "$(TARGET)" = "gpu" ]; then \
+		echo "---> Building with 'gpu' profile (includes whisperlive for GPU)..."; \
+		docker compose --profile gpu build; \
 	else \
-		echo "---> Building services. If you intend to use GPU and only GPU-specific services, ensure they are not tied to a profile not being activated."; \
+		echo "---> Building services without a specific cpu/gpu profile. This might include all services not assigned to a profile."; \
 		docker compose build; \
 	fi
 
 # Start services in detached mode
 up:
+ifndef TARGET
+	$(info TARGET not set for 'up'. Defaulting to cpu.)
+	$(eval TARGET := cpu)
+endif
 	@echo "---> Starting Docker Compose services..."
 	@if [ "$(TARGET)" = "cpu" ]; then \
 		echo "---> Activating 'cpu' profile to start whisperlive-cpu along with other services..."; \
-		docker compose --profile cpu up -d; \
+		docker compose --profile cpu up; \
 	elif [ "$(TARGET)" = "gpu" ]; then \
-		echo "---> Starting services for GPU. This will start 'whisperlive' (for GPU) and other default services. 'whisperlive-cpu' (profile=cpu) will not be started."; \
-		docker compose up -d; \
+		echo "---> Activating 'gpu' profile to start whisperlive (for GPU) along with other services..."; \
+		docker compose --profile gpu up; \
 	else \
-		echo "---> TARGET not explicitly cpu or gpu. Starting default services. 'whisperlive-cpu' (profile=cpu) may not start."; \
-		docker compose up -d; \
+		echo "---> TARGET not explicitly cpu or gpu. Starting default services. Profiled services (cpu/gpu specific) may not start correctly."; \
+		docker compose up; \
 	fi
 
 # Stop services
