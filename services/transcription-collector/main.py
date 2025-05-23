@@ -247,16 +247,6 @@ async def process_stream_message(message_id: str, message_data: Dict[str, Any]) 
         else:
             logger.info(f"[Msg {message_id}/Meet {internal_meeting_id}] Processing segments without speaker info.")
 
-        # Get speaker information from stream data if available
-        speaker_id = stream_data.get('speaker_id')
-        speaker_name = stream_data.get('speaker_name')
-        
-        # Log if we have speaker info
-        if speaker_id or speaker_name:
-            logger.info(f"[Msg {message_id}/Meet {internal_meeting_id}] Processing segments with speaker info: ID={speaker_id}, Name={speaker_name}")
-        else:
-            logger.info(f"[Msg {message_id}/Meet {internal_meeting_id}] Processing segments without speaker info.")
-
         # 4. Prepare segments for Redis Hash storage
         segment_count = 0
         hash_key = f"meeting:{internal_meeting_id}:segments"
@@ -290,15 +280,15 @@ async def process_stream_message(message_id: str, message_data: Dict[str, Any]) 
 
              # Create data for Redis Hash
              start_time_key = f"{start_time_float:.3f}"
-             session_uid_from_payload = stream_data.get('uid') # Get uid from message payload
+             session_uid_from_payload = stream_data.get('uid')
              segment_redis_data = {
                  "text": text_content,
                  "end_time": end_time_float,
                  "language": language_content,
                  "updated_at": datetime.utcnow().isoformat() + "Z",
                  "session_uid": session_uid_from_payload, # Add session_uid
-                 "speaker_id": speaker_id,  # Add speaker_id to segment data
-                 "speaker_name": speaker_name  # Add speaker_name to segment data
+                 "speaker_id": segment_speaker_id,  # Fixed: use segment-specific speaker_id
+                 "speaker_name": segment_speaker_name  # Fixed: use segment-specific speaker_name
              }
              segments_to_store[start_time_key] = json.dumps(segment_redis_data)
              segment_count += 1
@@ -916,6 +906,7 @@ async def get_transcript_by_native_id(
                     text=segment.text,
                     language=segment.language,
                     created_at=segment.created_at, # Corrected previously
+                    speaker=segment.speaker,  # Add speaker information from DB
                     # ---> ADD Populate absolute times <----
                     absolute_start_time=absolute_start_time,
                     absolute_end_time=absolute_end_time
@@ -969,6 +960,7 @@ async def get_transcript_by_native_id(
                         end_time=segment_data['end_time'],
                         text=segment_data['text'],
                         language=segment_data.get('language'), # Corrected previously
+                        speaker=segment_data.get('speaker_name'),  # Add speaker information from Redis
                         # created_at will be None for Redis segments
                         # ---> ADD Populate absolute times <----
                         absolute_start_time=absolute_start_time,
