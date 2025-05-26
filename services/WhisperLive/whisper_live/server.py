@@ -1111,6 +1111,7 @@ class TranscriptionServer:
         try:
             logging.info("New client connected")
             options = websocket.recv()
+            logging.info(f"Received raw message from client: {options}")
             options = json.loads(options)
             
             # Validate required parameters
@@ -1255,8 +1256,7 @@ class TranscriptionServer:
 
     def run(self,
             host,
-            # port=9090, #GPU version
-            port=9092, #CPU version
+            port=9090,  # Unified port for both GPU and CPU versions
             backend="tensorrt",
             faster_whisper_custom_model_path=None,
             whisper_tensorrt_path=None,
@@ -1287,7 +1287,8 @@ class TranscriptionServer:
 
         logger.info(f"SERVER_START: host={host}, port={port}, backend={self.backend.value}, single_model={single_model}")
         
-        self.start_health_check_server(host, port + 1) # Pass self.collector_client to health check
+        # Use fixed health check port 9091 for consistency
+        self.start_health_check_server(host, 9091)
         
         with serve(
             functools.partial(
@@ -1301,7 +1302,7 @@ class TranscriptionServer:
             port
         ) as server:
             self.is_healthy = True # WebSocket server is up
-            logger.info(f"SERVER_RUNNING: WhisperLive server running on {host}:{port} with health check on {host}:{port+1}/health")
+            logger.info(f"SERVER_RUNNING: WhisperLive server running on {host}:{port} with health check on {host}:9091/health")
             server.serve_forever()
 
     def voice_activity(self, websocket, frame_np):
