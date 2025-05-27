@@ -705,7 +705,8 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                   "Participant list not found; assuming meeting ended."
                 );
                 clearInterval(checkInterval);
-                performGlobalCleanup();
+                recorder.disconnect();
+                (window as any).triggerNodeGracefulLeave();
                 resolve();
                 return;
               }
@@ -726,13 +727,18 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                   "Meeting ended or bot alone for too long. Stopping recorder..."
                 );
                 clearInterval(checkInterval);
-                performGlobalCleanup();
+                recorder.disconnect();
+                (window as any).triggerNodeGracefulLeave();
                 resolve();
               }
             } catch (err: any) {
               (window as any).logBot(
                 `Error in participant check: ${err.message}`
               );
+              clearInterval(checkInterval);
+              recorder.disconnect();
+              (window as any).triggerNodeGracefulLeave();
+              resolve();
             }
           }, 5000);
 
@@ -747,6 +753,7 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
             }
             if (checkInterval) clearInterval(checkInterval);
             recorder.disconnect();
+            (window as any).triggerNodeGracefulLeave();
             resolve();
           });
 
@@ -770,6 +777,7 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
               }
               if (checkInterval) clearInterval(checkInterval);
               recorder.disconnect();
+              (window as any).triggerNodeGracefulLeave();
               resolve();
             }
           };
