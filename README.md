@@ -7,6 +7,17 @@
 # Vexa: API for **Real-Time Meeting Transcription**
 
 
+<p align="center">
+  <b>🚀 Help us reach 1000 stars! 🚀</b><br>
+  <b>Current: <img src="https://img.shields.io/github/stars/Vexa-ai/vexa?style=social" /> → Goal: 1000 ⭐️</b><br>
+  <a href="https://github.com/Vexa-ai/vexa/stargazers">
+
+  </a>
+</p>
+
+
+
+💬 [Join Discord Community!](https://discord.gg/Ga9duGkVz9)
 
 Vexa is an API for **real-time meeting transcription** using **meeting bots** and direct **streaming from web/mobile apps**. It extracts knowledge from various platforms including:
 
@@ -17,6 +28,8 @@ Vexa is an API for **real-time meeting transcription** using **meeting bots** an
 It serves as an **privacy-first**, **open source** alternative to `recall.ai`.
 
 It focuses on doing one job well: **clean, private, real-time transcription under your control so you can safely build on top**.
+
+
 
 
 ## Build on Top. In Hours, Not Months
@@ -31,14 +44,28 @@ For instance, the **Vexa Example Client** (see [Projects Built with Vexa](BUILT-
 
 Furthermore, with our **n8n integration** (see [Projects Built with Vexa](BUILT-WITH-VEXA.md) for examples), you can create incredibly complex workflows with no code, leveraging real-time transcription from Google Meet (with support for other platforms coming soon).
 
+<p align="center">
+  <img src="assets/simplified_flow.png" alt="Vexa Architecture Flow" width="100%"/>
+</p>
+
+
+- [api-gateway](./services/api-gateway): Routes API requests to appropriate services
+- [bot-manager](./services/bot-manager): Handles bot lifecycle management
+- [vexa-bot](./services/vexa-bot): The bot that joins meetings and captures audio
+- [WhisperLive](./services/WhisperLive): Real-time audio transcription service
+- [transcription-collector](./services/transcription-collector): Processes and stores transcription segments
+- [Database models](./libs/shared-models/shared_models/models.py): Data structures for storing meeting information
+
+
 
 ## Public Hosted API
 
 > 🔑 Get your API key at [www.vexa.ai](https://www.vexa.ai/?utm_source=github&utm_medium=readme&utm_campaign=vexa_repo) to try Vexa instantly. 
 
-> 🚀 Read [DEPLOYMENT.md](DEPLOYMENT.md) for self-hosting and local run.
+> 🚀 Read [DEPLOYMENT.md](DEPLOYMENT.md) for self-hosting and local run with single `make all` on CPU even on laptop or on your GPU server.
 
 The Vexa API is **publicly available** at [www.vexa.ai](https://www.vexa.ai/?utm_source=github&utm_medium=readme&utm_campaign=vexa_repo) with **self-service access** - get your API key in just 3 clicks and have everything running in under 5 minutes.
+
 
 ### Key features in this release:
 
@@ -46,6 +73,7 @@ The Vexa API is **publicly available** at [www.vexa.ai](https://www.vexa.ai/?utm
 - **Google Meet Bot Integration**: Programmatically send bots to join and transcribe meetings
 - **Real-Time Transcription**: Access meeting transcripts as they happen through the API
 - **Real-Time Translation**: Change the language of transcription to get instant translations across 99 languages
+
 
 ## API Capabilities
 
@@ -99,9 +127,12 @@ curl -H "X-API-Key: YOUR_CLIENT_API_KEY" \
   }
 }
 ```
+
 ## Projects Built with Vexa
 
 To see examples of projects built using the Vexa API, including our example client and other community contributions, please see the [BUILT-WITH-VEXA.md](BUILT-WITH-VEXA.md) file.
+
+> 💫 If you're building with Vexa, we'd love your support! [Star our repo](https://github.com/Vexa-ai/vexa/stargazers) to help us reach 600 stars.
 
 ### Features:
 - **Real-time multilingual transcription** supporting **99 languages** with **Whisper**
@@ -132,6 +163,8 @@ For **security-minded companies**, Vexa offers complete **self-deployment** opti
 
 To run Vexa locally on your own infrastructure, the primary command you'll use after cloning the repository is `make all`. This command sets up the environment (CPU by default, or GPU if specified), builds all necessary Docker images, and starts the services. 
 
+[3 min video tutorial](https://www.youtube.com/watch?v=bHMIByieVek)
+
 Detailed instructions: [Local Deployment and Testing Guide](DEPLOYMENT.md).
 
 ## Contributing
@@ -158,6 +191,7 @@ Contributors are welcome! Join our community and help shape Vexa's future. Here'
   - Check task descriptions (often on the roadmap or Discord) for bounty details and requirements.
 
 We look forward to your contributions!
+
 
 ## Project Links
 
