@@ -250,6 +250,12 @@ class TranscriptSpeakerMatcher:
             
         self.min_mic_level_threshold = min_mic_level_threshold
         self.speaker_activity_window_sec = timedelta(seconds=speaker_activity_window_sec)
+        
+        # Track last assigned speaker for continuity
+        self.last_assigned_speaker_name = None
+        self.last_assigned_speaker_id = None
+        self.last_assignment_time = None
+        
         speaker_logger.info(f"TranscriptSpeakerMatcher initialized with t0: {self.t0.isoformat()}")
 
     def _create_speaker_activity_segments(self, speaker_meta_list: List[SpeakerMeta]) -> List[SpeakerActivitySegment]:
@@ -286,7 +292,7 @@ class TranscriptSpeakerMatcher:
             for sm_entry in metas:
                 meta_bits = sm_entry.meta_bits
                 entry_timestamp = sm_entry.timestamp
-                speaker_logger.debug(f"  Meta entry for {user_id}: timestamp={entry_timestamp.isoformat()}, meta_bits='{meta_bits}', mic_level={sm_entry.mic_level}")
+                # speaker_logger.debug(f"  Meta entry for {user_id}: timestamp={entry_timestamp.isoformat()}, meta_bits='{meta_bits}', mic_level={sm_entry.mic_level}")
                 
                 if not meta_bits:
                     speaker_logger.debug(f"  Skipping entry with no meta_bits for {user_id}")
@@ -296,8 +302,18 @@ class TranscriptSpeakerMatcher:
                 
                 for i, bit in enumerate(meta_bits):
                     if bit == '1':
-                        slot_start_time = entry_timestamp - timedelta(seconds=(num_bits - i) * 0.1)
-                        slot_end_time = entry_timestamp - timedelta(seconds=(num_bits - i - 1) * 0.1)
+                        # Each bit from frontend represents 50ms (0.05s) of activity.
+                        # The meta_bits string has 'num_bits' items, covering num_bits * 0.05s.
+                        # entry_timestamp is the end of this activity window.
+                        # bit 'i' (0-indexed) is (num_bits - 1 - i) slots from the end.
+                        # Slot 'k' from the end (k=0 for newest, k=num_bits-1 for oldest) starts at T - (k+1)*0.05 and ends at T - k*0.05
+                        # Here, i=0 is oldest, i=num_bits-1 is newest.
+                        # For oldest bit (i=0), it refers to time T - num_bits*0.05 to T-(num_bits-1)*0.05
+                        # For newest bit (i=num_bits-1), it refers to time T - 1*0.05 to T - 0*0.05
+                        
+                        # Corrected calculation:
+                        slot_start_time = entry_timestamp - timedelta(seconds=(num_bits - i) * 0.05)
+                        slot_end_time = entry_timestamp - timedelta(seconds=(num_bits - i - 1) * 0.05)
                         active_sub_segments.append((slot_start_time, slot_end_time))
                         speaker_logger.debug(f"    Found active bit at position {i}: {slot_start_time.isoformat()} to {slot_end_time.isoformat()}")
             
@@ -341,6 +357,78 @@ class TranscriptSpeakerMatcher:
 
         return activity_segments
 
+    def _find_best_speaker_match(self, ts_segment: TranscriptSegment, speaker_activity_periods: List[SpeakerActivitySegment]) -> Tuple[Optional[str], Optional[str], float]:
+        """Find the best speaker match for a transcript segment.
+        
+        Returns:
+            Tuple of (speaker_name, speaker_id, confidence_score)
+        """
+        abs_segment_start = self.t0 + timedelta(seconds=ts_segment.start_timestamp)
+        abs_segment_end = self.t0 + timedelta(seconds=ts_segment.end_timestamp)
+        
+        segment_duration_td = abs_segment_end - abs_segment_start
+        if segment_duration_td.total_seconds() <= 0:
+            return None, None, 0.0
+
+        possible_matches = []
+
+        for active_period in speaker_activity_periods:
+            intersection_duration_td = active_period.intersection_with(abs_segment_start, abs_segment_end)
+            
+            if intersection_duration_td.total_seconds() > 0:
+                overlap_ratio = intersection_duration_td.total_seconds() / segment_duration_td.total_seconds()
+                possible_matches.append({
+                    "speaker_name": active_period.speaker_name,
+                    "speaker_id": active_period.speaker_id,
+                    "overlap_ratio": overlap_ratio,
+                    "mic_level": active_period.avg_mic_level
+                })
+        
+        if not possible_matches:
+            return None, None, 0.0
+            
+        # Sort by overlap ratio
+        possible_matches.sort(key=lambda m: m["overlap_ratio"], reverse=True)
+        best_match = possible_matches[0]
+        
+        return best_match["speaker_name"], best_match["speaker_id"], best_match["overlap_ratio"]
+
+    def _apply_speaker_continuity(self, ts_segment: TranscriptSegment, speaker_activity_periods: List[SpeakerActivitySegment]) -> bool:
+        """Apply speaker continuity logic for better transitions.
+        
+        Returns:
+            True if speaker was assigned via continuity logic
+        """
+        if not self.last_assigned_speaker_name or not self.last_assignment_time:
+            return False
+            
+        abs_segment_start = self.t0 + timedelta(seconds=ts_segment.start_timestamp)
+        
+        # Check if this segment is close to the last assignment (within 2.5 seconds)
+        time_gap = abs_segment_start - self.last_assignment_time
+        if time_gap.total_seconds() > 2.5: # Reduced from 5.0
+            return False
+            
+        # Check if the last assigned speaker is still active around this time
+        for period in speaker_activity_periods:
+            if (period.speaker_name == self.last_assigned_speaker_name and 
+                period.speaker_id == self.last_assigned_speaker_id):
+                
+                # Check if this period is close to our segment (within 3 seconds)
+                segment_start = self.t0 + timedelta(seconds=ts_segment.start_timestamp)
+                segment_end = self.t0 + timedelta(seconds=ts_segment.end_timestamp)
+                
+                time_to_period_start = abs((segment_start - period.start_time).total_seconds())
+                time_to_period_end = abs((segment_end - period.end_time).total_seconds())
+                
+                if min(time_to_period_start, time_to_period_end) <= 1.5: # Reduced from 3.0
+                    ts_segment.speaker = self.last_assigned_speaker_name
+                    ts_segment.speaker_id = self.last_assigned_speaker_id
+                    speaker_logger.debug(f"Applied continuity: Assigned '{ts_segment.content[:20]}' to {self.last_assigned_speaker_name} (continuity)")
+                    return True
+                    
+        return False
+
     def match(self, speaker_meta_data: List[SpeakerMeta], transcription_segments: List[TranscriptSegment]) -> List[TranscriptSegment]:
         """Match transcripts with speakers based on temporal proximity and mic activity.
         
@@ -353,8 +441,18 @@ class TranscriptSpeakerMatcher:
         """
         speaker_logger.debug(f"Matcher called with {len(speaker_meta_data)} speaker_meta entries and {len(transcription_segments)} transcription segments")
         
-        if not speaker_meta_data or not transcription_segments:
-            speaker_logger.info(f"Matcher: No speaker data ({len(speaker_meta_data)} entries) or transcription segments ({len(transcription_segments)} segments) to match.")
+        if not transcription_segments:
+            speaker_logger.info("Matcher: No transcription segments to match.")
+            return transcription_segments
+        
+        # If no speaker data, try to use the last known speaker for continuity
+        if not speaker_meta_data:
+            speaker_logger.info("Matcher: No speaker data available.")
+            if self.last_assigned_speaker_name:
+                for ts_segment in transcription_segments:
+                    ts_segment.speaker = self.last_assigned_speaker_name
+                    ts_segment.speaker_id = self.last_assigned_speaker_id
+                    speaker_logger.debug(f"No speaker data: Assigned '{ts_segment.content[:20]}' to last known speaker {self.last_assigned_speaker_name}")
             return transcription_segments
         
         # Debug: Log the speaker meta data we have
@@ -365,75 +463,136 @@ class TranscriptSpeakerMatcher:
 
         if not speaker_activity_periods:
             speaker_logger.info("Matcher: No consolidated speaker activity periods created.")
-            speaker_logger.debug(f"Debug: Input speaker meta had {len(speaker_meta_data)} entries but created 0 activity periods")
-            # Debug: Check if speaker meta has activity bits
-            for i, meta in enumerate(speaker_meta_data[:3]):  # Check first 3
-                speaker_logger.debug(f"Meta {i}: name={meta.name}, user_id={meta.user_id}, mic_level={meta.mic_level}, meta_bits={meta.meta_bits}")
+            # Use last known speaker if available
+            if self.last_assigned_speaker_name:
+                for ts_segment in transcription_segments:
+                    ts_segment.speaker = self.last_assigned_speaker_name
+                    ts_segment.speaker_id = self.last_assigned_speaker_id
+                    speaker_logger.debug(f"No activity periods: Assigned '{ts_segment.content[:20]}' to last known speaker {self.last_assigned_speaker_name}")
             return transcription_segments
 
         speaker_logger.debug(f"Created {len(speaker_activity_periods)} speaker activity periods for matching")
-        for i, period in enumerate(speaker_activity_periods[:3]):  # First 3 periods
-            speaker_logger.debug(f"Activity period {i}: {period.speaker_name} ({period.speaker_id}) from {period.start_time.isoformat()} to {period.end_time.isoformat()}")
-
-        for ts_segment in transcription_segments:
-            abs_segment_start = self.t0 + timedelta(seconds=ts_segment.start_timestamp)
-            abs_segment_end = self.t0 + timedelta(seconds=ts_segment.end_timestamp)
-            
-            speaker_logger.debug(f"Matching segment '{ts_segment.content[:20]}' from {abs_segment_start.isoformat()} to {abs_segment_end.isoformat()}")
-            
-            segment_duration_td = abs_segment_end - abs_segment_start
-            if segment_duration_td.total_seconds() <= 0:
-                continue
-
-            best_match_speaker_name: Optional[str] = None
-            best_match_speaker_id: Optional[str] = None
-            max_overlap_ratio = 0.0
-            
-            possible_matches = []
-
-            for active_period in speaker_activity_periods:
-                intersection_duration_td = active_period.intersection_with(abs_segment_start, abs_segment_end)
-                
-                if intersection_duration_td.total_seconds() > 0:
-                    overlap_ratio = intersection_duration_td.total_seconds() / segment_duration_td.total_seconds()
-                    possible_matches.append({
-                        "speaker_name": active_period.speaker_name,
-                        "speaker_id": active_period.speaker_id,
-                        "overlap_ratio": overlap_ratio,
-                        "mic_level": active_period.avg_mic_level
-                    })
-            
-            speaker_logger.debug(f"Found {len(possible_matches)} possible matches for segment '{ts_segment.content[:20]}'")
-            
-            if possible_matches:
-                possible_matches.sort(key=lambda m: m["overlap_ratio"], reverse=True)
-                
-                best_match = possible_matches[0]
-                
-                speaker_logger.debug(f"Best match for '{ts_segment.content[:20]}': {best_match['speaker_name']} with overlap {best_match['overlap_ratio']:.2f}")
-                
-                if best_match["overlap_ratio"] > 0.02:  # Lowered from 0.05 to 0.02 for longer segments
-                    ts_segment.speaker = best_match["speaker_name"]
-                    ts_segment.speaker_id = best_match["speaker_id"]
-                    speaker_logger.debug(f"Assigned speaker {best_match['speaker_name']} to segment '{ts_segment.content[:20]}'")
-                else:
-                    speaker_logger.debug(f"No significant match for '{ts_segment.content[:20]}'. Best overlap: {best_match['speaker_name']} ({best_match['overlap_ratio']:.2f})")
         
-        # Fallback logic: If only one speaker has any activity, assign unmatched segments to that speaker
-        if speaker_activity_periods:
-            unique_speakers = set((period.speaker_name, period.speaker_id) for period in speaker_activity_periods)
-            if len(unique_speakers) == 1:
-                fallback_speaker_name, fallback_speaker_id = next(iter(unique_speakers))
-                unassigned_count = 0
-                for ts_segment in transcription_segments:
-                    if ts_segment.speaker is None:
+        # Get all unique speakers for fallback
+        unique_speakers = list(set((period.speaker_name, period.speaker_id) for period in speaker_activity_periods))
+        
+        for ts_segment in transcription_segments:
+            speaker_logger.debug(f"Matching segment '{ts_segment.content[:20]}'")
+            
+            # Try continuity first
+            if self._apply_speaker_continuity(ts_segment, speaker_activity_periods):
+                self.last_assignment_time = self.t0 + timedelta(seconds=ts_segment.end_timestamp)
+                continue
+            
+            # Try direct matching
+            speaker_name, speaker_id, confidence = self._find_best_speaker_match(ts_segment, speaker_activity_periods)
+            
+            # Use improved threshold based on segment length
+            segment_duration = ts_segment.end_timestamp - ts_segment.start_timestamp
+            min_threshold = 0.15 if segment_duration > 3.0 else 0.1 if segment_duration > 1.0 else 0.05  # Adaptive threshold
+            
+            if speaker_name and confidence > min_threshold:
+                ts_segment.speaker = speaker_name
+                ts_segment.speaker_id = speaker_id
+                self.last_assigned_speaker_name = speaker_name
+                self.last_assigned_speaker_id = speaker_id
+                self.last_assignment_time = self.t0 + timedelta(seconds=ts_segment.end_timestamp)
+                speaker_logger.debug(f"Direct match: Assigned '{ts_segment.content[:20]}' to {speaker_name} (confidence: {confidence:.3f})")
+                continue
+            
+            # Fallback logic
+            if unique_speakers:
+                abs_segment_start_dt = self.t0 + timedelta(seconds=ts_segment.start_timestamp) # Used for recency checks
+
+                if len(unique_speakers) == 1:
+                    # Only one speaker available - assign to them
+                    fallback_speaker_name, fallback_speaker_id = unique_speakers[0]
+                    ts_segment.speaker = fallback_speaker_name
+                    ts_segment.speaker_id = fallback_speaker_id
+                    self.last_assigned_speaker_name = fallback_speaker_name
+                    self.last_assigned_speaker_id = fallback_speaker_id
+                    self.last_assignment_time = self.t0 + timedelta(seconds=ts_segment.end_timestamp)
+                    speaker_logger.debug(f"Single speaker fallback: Assigned '{ts_segment.content[:20]}' to {fallback_speaker_name}")
+                
+                elif self.last_assigned_speaker_name:
+                    # Multiple speakers, and we have a last known speaker.
+                    time_since_last_assignment_sec = float('inf')
+                    if self.last_assignment_time:
+                        time_since_last_assignment_sec = (abs_segment_start_dt - self.last_assignment_time).total_seconds()
+
+                    if time_since_last_assignment_sec < 7.0: # If last speaker was recent, prefer them.
+                        ts_segment.speaker = self.last_assigned_speaker_name
+                        ts_segment.speaker_id = self.last_assigned_speaker_id
+                        # Update last_assignment_time as we are re-confirming this speaker
+                        self.last_assignment_time = self.t0 + timedelta(seconds=ts_segment.end_timestamp)
+                        speaker_logger.debug(f"Last speaker fallback (recent): Assigned '{ts_segment.content[:20]}' to {self.last_assigned_speaker_name}")
+                    else:
+                        # Last speaker is stale. Find the most recently active speaker from unique_speakers.
+                        best_recent_speaker_name = None
+                        best_recent_speaker_id = None
+                        # Initialize with a very old timestamp, ensuring it's timezone-aware if comparing with timezone-aware datetimes
+                        latest_activity_time_for_best = dt.min.replace(tzinfo=timezone.utc)
+
+                        for sp_name, sp_id in unique_speakers:
+                            for period in speaker_activity_periods:
+                                if period.speaker_id == sp_id:
+                                    # Consider periods ending near or overlapping the current segment start
+                                    # Check if period.end_time is more recent and relevant
+                                    if period.end_time > latest_activity_time_for_best and \
+                                       (abs_segment_start_dt - period.end_time).total_seconds() < 10.0 : # Ends within 10s before segment start, or into the segment
+                                        latest_activity_time_for_best = period.end_time
+                                        best_recent_speaker_name = sp_name
+                                        best_recent_speaker_id = sp_id
+                        
+                        if best_recent_speaker_name:
+                            ts_segment.speaker = best_recent_speaker_name
+                            ts_segment.speaker_id = best_recent_speaker_id
+                            self.last_assigned_speaker_name = best_recent_speaker_name
+                            self.last_assigned_speaker_id = best_recent_speaker_id
+                            self.last_assignment_time = self.t0 + timedelta(seconds=ts_segment.end_timestamp)
+                            speaker_logger.debug(f"Fallback (last speaker stale, chose most recent active '{best_recent_speaker_name}'): Assigned '{ts_segment.content[:20]}'")
+                        else: # No recent active speaker found, fall back to the very first unique speaker as a last resort
+                              # This case implies unique_speakers is not empty.
+                            fallback_speaker_name, fallback_speaker_id = unique_speakers[0]
+                            ts_segment.speaker = fallback_speaker_name
+                            ts_segment.speaker_id = fallback_speaker_id
+                            self.last_assigned_speaker_name = fallback_speaker_name
+                            self.last_assigned_speaker_id = fallback_speaker_id
+                            self.last_assignment_time = self.t0 + timedelta(seconds=ts_segment.end_timestamp)
+                            speaker_logger.debug(f"Fallback (last speaker stale, no recent found, chose first unique '{fallback_speaker_name}'): Assigned '{ts_segment.content[:20]}'")
+                            
+                else: # Multiple speakers, no last_assigned_speaker_name. Find most recently active.
+                    best_recent_speaker_name = None
+                    best_recent_speaker_id = None
+                    latest_activity_time_for_best = dt.min.replace(tzinfo=timezone.utc)
+
+                    for sp_name, sp_id in unique_speakers:
+                        for period in speaker_activity_periods:
+                            if period.speaker_id == sp_id:
+                                if period.end_time > latest_activity_time_for_best and \
+                                   (abs_segment_start_dt - period.end_time).total_seconds() < 10.0: # Ends within 10s before or into segment
+                                    latest_activity_time_for_best = period.end_time
+                                    best_recent_speaker_name = sp_name
+                                    best_recent_speaker_id = sp_id
+                    
+                    if best_recent_speaker_name:
+                        ts_segment.speaker = best_recent_speaker_name
+                        ts_segment.speaker_id = best_recent_speaker_id
+                        self.last_assigned_speaker_name = best_recent_speaker_name
+                        self.last_assigned_speaker_id = best_recent_speaker_id
+                        self.last_assignment_time = self.t0 + timedelta(seconds=ts_segment.end_timestamp)
+                        speaker_logger.debug(f"Fallback (no prior, chose most recent active '{best_recent_speaker_name}'): Assigned '{ts_segment.content[:20]}'")
+                    else: # Default to the first unique speaker if no one clearly most recent
+                        fallback_speaker_name, fallback_speaker_id = unique_speakers[0]
                         ts_segment.speaker = fallback_speaker_name
                         ts_segment.speaker_id = fallback_speaker_id
-                        unassigned_count += 1
-                        speaker_logger.debug(f"Fallback: Assigned '{ts_segment.content[:20]}' to {fallback_speaker_name} (only active speaker)")
-                
-                if unassigned_count > 0:
-                    speaker_logger.info(f"Fallback logic: Assigned {unassigned_count} unmatched segments to {fallback_speaker_name} (only active speaker)")
+                        self.last_assigned_speaker_name = fallback_speaker_name
+                        self.last_assigned_speaker_id = fallback_speaker_id
+                        self.last_assignment_time = self.t0 + timedelta(seconds=ts_segment.end_timestamp)
+                        speaker_logger.debug(f"Fallback (no prior, no recent found, chose first unique '{fallback_speaker_name}'): Assigned '{ts_segment.content[:20]}'")
+            else:
+                # No speakers available at all - this should not happen, but handle gracefully
+                speaker_logger.warning(f"No speakers available for segment '{ts_segment.content[:20]}' - leaving unassigned")
 
         return transcription_segments
 
@@ -1585,12 +1744,12 @@ class ServeClientBase(object):
         timestamp = datetime.datetime.utcnow()
         iso_timestamp = timestamp.isoformat() + "Z"
         
-        # Don't update to None if we already have a speaker - only record in timeline
-        if speaker_id is None and speaker_name is None and self.current_speaker_id is not None:
-            logging.info(f"Ignoring None speaker update for {self.client_uid} - keeping current speaker: {self.current_speaker_name} ({self.current_speaker_id})")
+        # Validate speaker data - don't accept None/empty values unless it's an explicit clear
+        if not speaker_id or not speaker_name:
+            logging.warning(f"Received invalid speaker update for {self.client_uid}: speaker_id='{speaker_id}', speaker_name='{speaker_name}' - ignoring")
             return
         
-        # Record in timeline
+        # Record in timeline (always record valid updates)
         self.speaker_timeline.append({
             "timestamp": timestamp,  # Store datetime object for comparisons
             "iso_timestamp": iso_timestamp,  # Store string for JSON
@@ -2199,6 +2358,21 @@ class ServeClientFasterWhisper(ServeClientBase):
         """
         # Get the speaker active during this segment
         speaker_id, speaker_name = self.get_speaker_at_time(start, end)
+        
+        # Ensure we never have unknown speakers - use fallback if needed
+        if speaker_id is None or speaker_name is None:
+            # Use current speaker if available
+            if self.current_speaker_id and self.current_speaker_name:
+                speaker_id = self.current_speaker_id
+                speaker_name = self.current_speaker_name
+            else:
+                # Last resort fallback - create a default speaker
+                speaker_id = "default_speaker"
+                speaker_name = "Speaker 1"
+                # Update current speaker to this fallback
+                self.current_speaker_id = speaker_id
+                self.current_speaker_name = speaker_name
+                logging.info(f"Using fallback speaker for segment: {speaker_name} ({speaker_id})")
         
         return {
             'start': "{:.3f}".format(start),
