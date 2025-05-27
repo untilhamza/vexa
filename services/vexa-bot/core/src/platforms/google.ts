@@ -325,8 +325,7 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
           let socket: WebSocket | null = null;
           let isServerReady = false;
           let retryCount = 0;
-          const maxRetries = 5;
-          const retryDelay = 2000;
+          const baseRetryDelay = botConfigData.reconnectionIntervalMs || 5000; // ADDED: Configurable retry delay, default 5s
 
           // --- ADDED: New interval reference for advanced speaker monitoring ---
           let micPollingInterval: ReturnType<typeof setInterval> | null = null;
@@ -447,31 +446,18 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                   micPollingInterval = null;
                 }
 
-                // Retry logic
-                if (retryCount < maxRetries) {
-                  const exponentialDelay = retryDelay * Math.pow(2, retryCount);
-                  retryCount++;
-                  (window as any).logBot(
-                    `Attempting to reconnect in ${exponentialDelay}ms. Retry ${retryCount}/${maxRetries}`
-                  );
+                // Retry logic - now retries indefinitely
+                retryCount++;
+                (window as any).logBot(
+                  `Attempting to reconnect in ${baseRetryDelay}ms. Retry attempt ${retryCount}`
+                );
 
-                  setTimeout(() => {
-                    (window as any).logBot(
-                      `Retrying WebSocket connection (${retryCount}/${maxRetries})...`
-                    );
-                    setupWebSocket();
-                  }, exponentialDelay);
-                } else {
+                setTimeout(() => {
                   (window as any).logBot(
-                    "Maximum WebSocket reconnection attempts reached. Giving up."
+                    `Retrying WebSocket connection (attempt ${retryCount})...`
                   );
-                  performGlobalCleanup();
-                  reject(
-                    new Error(
-                      "WebSocket connection failed after maximum retries"
-                    )
-                  );
-                }
+                  setupWebSocket();
+                }, baseRetryDelay);
               };
 
               // Add socket cleanup
@@ -482,28 +468,18 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
               });
             } catch (e: any) {
               (window as any).logBot(`Error creating WebSocket: ${e.message}`);
-              // For initial connection errors, handle with retry logic
-              if (retryCount < maxRetries) {
-                const exponentialDelay = retryDelay * Math.pow(2, retryCount);
-                retryCount++;
-                (window as any).logBot(
-                  `Attempting to reconnect in ${exponentialDelay}ms. Retry ${retryCount}/${maxRetries}`
-                );
+              // For initial connection errors, handle with retry logic - now retries indefinitely
+              retryCount++;
+              (window as any).logBot(
+                `Error during WebSocket setup. Attempting to reconnect in ${baseRetryDelay}ms. Retry attempt ${retryCount}`
+              );
 
-                setTimeout(() => {
-                  (window as any).logBot(
-                    `Retrying WebSocket connection (${retryCount}/${maxRetries})...`
-                  );
-                  setupWebSocket();
-                }, exponentialDelay);
-              } else {
-                performGlobalCleanup();
-                return reject(
-                  new Error(
-                    `WebSocket creation failed after ${maxRetries} attempts: ${e.message}`
-                  )
+              setTimeout(() => {
+                (window as any).logBot(
+                  `Retrying WebSocket connection (attempt ${retryCount})...`
                 );
-              }
+                setupWebSocket();
+              }, baseRetryDelay);
             }
           };
 
