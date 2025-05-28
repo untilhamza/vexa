@@ -332,6 +332,15 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
           let micPollingInterval: ReturnType<typeof setInterval> | null = null;
           // --- --------------------------------------------------------------- ---
 
+          // --- ADDED: Audio chunk tracking for correlation ---
+          let audioChunkCounter = 0;
+          let audioChunkTimestamps: Array<{
+            chunkId: number;
+            timestamp: string;
+            duration: number;
+          }> = [];
+          // --- --------------------------------------------- ---
+
           const setupWebSocket = () => {
             try {
               if (socket) {
@@ -644,12 +653,40 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                 data[leftIndex] +
                 (data[rightIndex] - data[leftIndex]) * fraction;
             }
+
+            // --- ADDED: Track audio chunk timing ---
+            const chunkTimestamp = new Date().toISOString();
+            const chunkId = audioChunkCounter++;
+            const chunkDuration = resampledData.length / 16000; // Duration in seconds at 16kHz
+
+            audioChunkTimestamps.push({
+              chunkId: chunkId,
+              timestamp: chunkTimestamp,
+              duration: chunkDuration,
+            });
+
+            // Keep only last 100 chunks in memory
+            if (audioChunkTimestamps.length > 100) {
+              audioChunkTimestamps = audioChunkTimestamps.slice(-100);
+            }
+            // --- --------------------------------- ---
+
             // Send resampledData
             if (socket && socket.readyState === WebSocket.OPEN) {
               // Double check before sending
-              socket.send(resampledData); // send teh audio to whisperlive socket.
+              socket.send(resampledData); // send the audio to whisperlive socket.
 
-              //TODO: include speaker information...
+              // --- ADDED: Send audio chunk metadata immediately after audio ---
+              socket.send(
+                JSON.stringify({
+                  type: "audio_chunk_metadata",
+                  chunk_id: chunkId,
+                  timestamp: chunkTimestamp,
+                  duration: chunkDuration,
+                  uid: (window as any).currentWsUid || generateUUID(),
+                })
+              );
+              // --- --------------------------------------------------------- ---
             }
           };
 
@@ -783,6 +820,12 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
               el: HTMLElement;
               micNode: HTMLElement;
               micActivity: string[]; // Stores '0' or '1'
+              lastState: boolean; // Track last known state
+              stateChanges: Array<{
+                // Track state changes with timestamps
+                timestamp: string;
+                state: "started" | "stopped";
+              }>;
             }> = [];
             let callName: string | null = null;
             let nodeRefreshCounter = 0; // To refresh nodes less frequently
@@ -903,6 +946,8 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                           el: el,
                           micNode: micNode,
                           micActivity: [],
+                          lastState: false, // Initialize as not speaking
+                          stateChanges: [], // Initialize empty state changes
                         });
                       } else {
                         (window as any).logBot(
@@ -921,6 +966,24 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                   if (node && node.micNode) {
                     const isSpeaking = node.micNode.classList.contains("HX2H7");
                     node.micActivity.push(isSpeaking ? "1" : "0");
+
+                    // --- ADDED: Track state changes with precise timestamps ---
+                    if (isSpeaking !== node.lastState) {
+                      const changeTimestamp = new Date().toISOString();
+                      node.stateChanges.push({
+                        timestamp: changeTimestamp,
+                        state: isSpeaking ? "started" : "stopped",
+                      });
+                      node.lastState = isSpeaking;
+
+                      // Log state change
+                      (window as any).logBot(
+                        `Speaker ${node.name} ${
+                          isSpeaking ? "started" : "stopped"
+                        } speaking at ${changeTimestamp}`
+                      );
+                    }
+                    // --- ---------------------------------------------------- ---
                   }
                 });
 
@@ -933,6 +996,8 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                     participantNodes.length > 0
                   ) {
                     const timestamp = new Date().toISOString();
+
+                    // --- MODIFIED: Include state changes in payload ---
                     const payload = {
                       type: "speaker_activity_update",
                       uid: (window as any).currentWsUid || generateUUID(),
@@ -943,8 +1008,14 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                         speaker_id: p.id,
                         speaker_name: p.name,
                         mic_activity_bits: p.micActivity.join(""),
+                        delay_sec: 0.1, // Reduced delay since we're tracking more precisely
+                        state_changes: p.stateChanges, // Include state changes
                       })),
+                      // Include recent audio chunk info for correlation
+                      recent_audio_chunks: audioChunkTimestamps.slice(-10), // Last 10 chunks
                     };
+                    // --- ---------------------------------------------- ---
+
                     let payloadStr;
                     try {
                       payloadStr = JSON.stringify(payload);
@@ -962,7 +1033,11 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                       `AdvancedSpeakerMonitoring: Sent speaker activity update. Participants: ${payload.speakers.length}`
                     );
 
-                    participantNodes.forEach((p) => (p.micActivity = []));
+                    // Clear processed data
+                    participantNodes.forEach((p) => {
+                      p.micActivity = [];
+                      p.stateChanges = []; // Clear state changes after sending
+                    });
                   } else if (
                     participantNodes.length === 0 &&
                     nodeRefreshCounter > 50

@@ -80,10 +80,14 @@ class SpeakerMeta(BaseModel):
             meta = speaker_payload.get('mic_activity_bits', '')
             mic_level = sum(1 for c in meta if c == '1') / max(len(meta), 1) if meta else 0.0
             
+            # Store state changes if provided (new enhanced format)
+            state_changes = speaker_payload.get('state_changes', [])
+            
             return cls(
                 name=speaker_payload['speaker_name'],
                 mic_level=mic_level,
                 timestamp=timestamp_override,
+                delay_sec=float(speaker_payload.get('delay_sec', 0.0)),  # Added parsing for delay_sec
                 user_id=speaker_payload['speaker_id'],
                 meeting_id=meeting_id,
                 meta_bits=meta
@@ -387,8 +391,8 @@ class TranscriptSpeakerMatcher:
         if not possible_matches:
             return None, None, 0.0
             
-        # Sort by overlap ratio
-        possible_matches.sort(key=lambda m: m["overlap_ratio"], reverse=True)
+        # Sort by overlap ratio, then by mic_level as a secondary factor
+        possible_matches.sort(key=lambda m: (m["overlap_ratio"], m["mic_level"]), reverse=True)
         best_match = possible_matches[0]
         
         return best_match["speaker_name"], best_match["speaker_id"], best_match["overlap_ratio"]
@@ -1401,11 +1405,90 @@ class TranscriptionServer:
                 logging.warning(f"Received message '{message_type}' for unknown client")
                 return False
             
-            # Handle speaker activity update messages (new advanced format)
-            if message_type == "speaker_activity_update":
+            # Handle audio chunk metadata messages (new)
+            if message_type == "audio_chunk_metadata":
+                chunk_id = message.get("chunk_id")
+                timestamp = message.get("timestamp")
+                duration = message.get("duration")
+                
+                if chunk_id is not None and timestamp and duration:
+                    try:
+                        # Parse and store the audio chunk metadata
+                        chunk_timestamp = dt.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        if chunk_timestamp.tzinfo is None:
+                            chunk_timestamp = chunk_timestamp.replace(tzinfo=timezone.utc)
+                            
+                        client.audio_chunks[chunk_id] = {
+                            "timestamp": chunk_timestamp,
+                            "duration": duration
+                        }
+                        
+                        # Keep only recent chunks (last 100)
+                        if len(client.audio_chunks) > 100:
+                            oldest_ids = sorted(client.audio_chunks.keys())[:len(client.audio_chunks) - 100]
+                            for old_id in oldest_ids:
+                                del client.audio_chunks[old_id]
+                                
+                        logging.debug(f"[Client {client.client_uid}] Stored audio chunk {chunk_id} at {timestamp}")
+                        
+                    except Exception as e:
+                        logging.error(f"[Client {client.client_uid}] Error processing audio_chunk_metadata: {e}")
+                        
+                return True
+            
+            # Handle speaker activity update messages (enhanced with state changes)
+            elif message_type == "speaker_activity_update":
                 logging.info(f"[Client {client.client_uid}] Received speaker_activity_update message")
                 try:
-                    # Convert speaker activity to SpeakerMeta objects
+                    # Process state changes if present
+                    speakers = message.get("speakers", [])
+                    for speaker_data in speakers:
+                        speaker_id = speaker_data.get("speaker_id")
+                        speaker_name = speaker_data.get("speaker_name")
+                        state_changes = speaker_data.get("state_changes", [])
+                        
+                        # Process state changes for precise speaker activity windows
+                        for change in state_changes:
+                            try:
+                                change_time = dt.fromisoformat(change["timestamp"].replace('Z', '+00:00'))
+                                if change_time.tzinfo is None:
+                                    change_time = change_time.replace(tzinfo=timezone.utc)
+                                    
+                                state = change["state"]  # 'started' or 'stopped'
+                                
+                                # Update speaker state tracking
+                                if speaker_id not in client.speaker_states:
+                                    client.speaker_states[speaker_id] = {
+                                        "name": speaker_name,
+                                        "is_speaking": False,
+                                        "last_change_time": None,
+                                        "activity_windows": []
+                                    }
+                                
+                                speaker_state = client.speaker_states[speaker_id]
+                                
+                                if state == "started" and not speaker_state["is_speaking"]:
+                                    speaker_state["is_speaking"] = True
+                                    speaker_state["last_change_time"] = change_time
+                                    speaker_logger.info(f"Speaker {speaker_name} started at {change_time.isoformat()}")
+                                    
+                                elif state == "stopped" and speaker_state["is_speaking"]:
+                                    if speaker_state["last_change_time"]:
+                                        # Record the activity window
+                                        speaker_state["activity_windows"].append({
+                                            "start": speaker_state["last_change_time"],
+                                            "end": change_time,
+                                            "speaker_name": speaker_name,
+                                            "speaker_id": speaker_id
+                                        })
+                                        speaker_logger.info(f"Speaker {speaker_name} stopped at {change_time.isoformat()}, window: {speaker_state['last_change_time'].isoformat()} to {change_time.isoformat()}")
+                                    speaker_state["is_speaking"] = False
+                                    speaker_state["last_change_time"] = change_time
+                                    
+                            except Exception as e:
+                                speaker_logger.error(f"Error processing state change: {e}")
+                    
+                    # Also process the traditional speaker meta data
                     speaker_meta_list = convert_speaker_activity_to_meta(message)
                     
                     if speaker_meta_list:
@@ -1469,6 +1552,14 @@ class ServeClientBase(object):
         self.transcript_speaker_matcher = TranscriptSpeakerMatcher(t0=self.transcription_start_time)
         speaker_logger.info(f"ServeClient {self.client_uid} initialized with t0: {self.transcription_start_time.isoformat()}")
 
+        # Audio chunk tracking for precise timestamps
+        self.audio_chunks: Dict[int, Dict[str, Any]] = {}  # chunk_id -> {timestamp, duration}
+        self.current_audio_chunk_id: Optional[int] = None
+        self.audio_chunk_start_time: Optional[dt] = None
+        
+        # Enhanced speaker state tracking
+        self.speaker_states: Dict[str, Dict[str, Any]] = {}  # speaker_id -> {is_speaking, last_change_time}
+        
         # Old speaker tracking - can be removed or refactored if new system covers it.
         # self.current_speaker_id = None 
         # self.current_speaker_name = None
@@ -1636,34 +1727,42 @@ class ServeClientBase(object):
                 logging.error(f"ERROR: Missing required fields for client {self.client_uid}: platform={self.platform}, meeting_url={self.meeting_url}, token={self.token}")
                 return
 
-            # 1. Convert raw Whisper segments to TranscriptSegment objects
-            processed_transcript_segments: List[TranscriptSegment] = []
-            for seg_data in segments: # Assuming segments is a list of dicts from Whisper
-                try:
-                    # Pass self.transcription_start_time as t0 for relative to absolute conversion
-                    ts_seg = TranscriptSegment.from_whisper_live_segment(seg_data, t0_timestamp=self.transcription_start_time)
-                    processed_transcript_segments.append(ts_seg)
-                except ValueError as e:
-                    speaker_logger.error(f"Skipping invalid Whisper segment: {seg_data}. Error: {e}")
-                    continue
+            # Try enhanced matching first if we have speaker state data
+            if self.speaker_states and any(state.get("activity_windows") for state in self.speaker_states.values()):
+                segments_with_speakers = self.match_speakers_enhanced(segments)
+                speaker_logger.info(f"Using enhanced speaker matching for {len(segments)} segments")
+            else:
+                # Fall back to original matching method
+                speaker_logger.info(f"Using traditional speaker matching for {len(segments)} segments")
+                
+                # 1. Convert raw Whisper segments to TranscriptSegment objects
+                processed_transcript_segments: List[TranscriptSegment] = []
+                for seg_data in segments: # Assuming segments is a list of dicts from Whisper
+                    try:
+                        # Pass self.transcription_start_time as t0 for relative to absolute conversion
+                        ts_seg = TranscriptSegment.from_whisper_live_segment(seg_data, t0_timestamp=self.transcription_start_time)
+                        processed_transcript_segments.append(ts_seg)
+                    except ValueError as e:
+                        speaker_logger.error(f"Skipping invalid Whisper segment: {seg_data}. Error: {e}")
+                        continue
+                
+                # 2. Match speakers to these TranscriptSegment objects
+                # Lock speaker_activity_data if it can be modified by another thread (e.g., process_websocket_message)
+                # For simplicity, direct access here assumes process_websocket_message updates it sequentially or with its own locks if needed.
+                # It might be safer to copy self.speaker_activity_data if there's a risk of concurrent modification during matching.
+                current_speaker_activity_snapshot = self.speaker_activity_data.copy() # Take a snapshot for matching
+
+                matched_segments = self.transcript_speaker_matcher.match(
+                    current_speaker_activity_snapshot, 
+                    processed_transcript_segments
+                )
+
+                # 3. Convert matched TranscriptSegment objects back to dictionaries for sending
+                segments_with_speakers = [ts.to_dict() for ts in matched_segments]
             
-            # 2. Match speakers to these TranscriptSegment objects
-            # Lock speaker_activity_data if it can be modified by another thread (e.g., process_websocket_message)
-            # For simplicity, direct access here assumes process_websocket_message updates it sequentially or with its own locks if needed.
-            # It might be safer to copy self.speaker_activity_data if there's a risk of concurrent modification during matching.
-            current_speaker_activity_snapshot = self.speaker_activity_data.copy() # Take a snapshot for matching
-
-            matched_segments = self.transcript_speaker_matcher.match(
-                current_speaker_activity_snapshot, 
-                processed_transcript_segments
-            )
-
-            # 3. Convert matched TranscriptSegment objects back to dictionaries for sending
-            segments_to_send = [ts.to_dict() for ts in matched_segments]
-
             data = {
                 "uid": self.client_uid,
-                "segments": segments_to_send, # Send the matched segments
+                "segments": segments_with_speakers, # Send the matched segments
             }
             self.websocket.send(json.dumps(data))
             
@@ -1675,13 +1774,13 @@ class ServeClientBase(object):
                     token=self.token,
                     platform=self.platform,
                     meeting_id=self.meeting_id,
-                    segments=segments_to_send, # Send matched segments to collector as well
+                    segments=segments_with_speakers, # Send matched segments to collector as well
                     session_uid=self.client_uid,
                     # speaker_id and speaker_name are now part of each segment in segments_to_send
                 )
              # Log the transcription data to file with more detailed formatting 
             formatted_log_segments = []
-            for i, seg_dict in enumerate(segments_to_send):
+            for i, seg_dict in enumerate(segments_with_speakers):
                 speaker_name = seg_dict.get('speaker_name', 'Unknown')
                 speaker_id = seg_dict.get('speaker_id', 'N/A')
                 text_content = seg_dict.get('text', '')
@@ -1699,6 +1798,137 @@ class ServeClientBase(object):
             logger.info(f"TRANSCRIPTION: client={self.client_uid}, platform={self.platform}, meeting_url={self.meeting_url}, token={self.token}, meeting_id={self.meeting_id}, segments=\n" + "\n".join(formatted_log_segments))
         except Exception as e:
             logging.error(f"[ERROR]: Sending data to client: {e}", exc_info=True)
+
+    def match_speakers_enhanced(self, segments):
+        """
+        Enhanced speaker matching using precise timestamps from client.
+        
+        Args:
+            segments: List of raw transcription segments from Whisper
+            
+        Returns:
+            List of segments with speaker information added
+        """
+        segments_with_speakers = []
+        
+        for seg in segments:
+            # Get segment timing
+            start_time = float(seg.get("start", 0))
+            end_time = float(seg.get("end", 0))
+            
+            # Convert to absolute timestamps
+            seg_start_abs = self.transcription_start_time + timedelta(seconds=start_time)
+            seg_end_abs = self.transcription_start_time + timedelta(seconds=end_time)
+            seg_mid_abs = seg_start_abs + (seg_end_abs - seg_start_abs) / 2
+            
+            speaker_logger.debug(f"Matching segment '{seg.get('text', '')[:30]}' ({seg_start_abs.isoformat()} to {seg_end_abs.isoformat()})")
+            
+            # Find the best speaker match using activity windows
+            best_speaker = None
+            best_overlap = 0.0
+            
+            for speaker_id, speaker_data in self.speaker_states.items():
+                speaker_name = speaker_data.get("name")
+                activity_windows = speaker_data.get("activity_windows", [])
+                
+                for window in activity_windows:
+                    window_start = window["start"]
+                    window_end = window["end"]
+                    
+                    # Calculate overlap between segment and activity window
+                    overlap_start = max(seg_start_abs, window_start)
+                    overlap_end = min(seg_end_abs, window_end)
+                    
+                    if overlap_end > overlap_start:
+                        overlap_duration = (overlap_end - overlap_start).total_seconds()
+                        segment_duration = (seg_end_abs - seg_start_abs).total_seconds()
+                        
+                        if segment_duration > 0:
+                            overlap_ratio = overlap_duration / segment_duration
+                            
+                            if overlap_ratio > best_overlap:
+                                best_overlap = overlap_ratio
+                                best_speaker = {
+                                    "id": speaker_id,
+                                    "name": speaker_name
+                                }
+            
+            # Check currently speaking speakers if no historical match
+            if not best_speaker:
+                # First, check for speakers who are currently speaking
+                current_speakers = []
+                for speaker_id, speaker_data in self.speaker_states.items():
+                    if speaker_data.get("is_speaking"):
+                        current_speakers.append({
+                            "id": speaker_id,
+                            "name": speaker_data.get("name"),
+                            "start_time": speaker_data.get("last_change_time")
+                        })
+                
+                # If we have current speakers, pick the one who started most recently before our segment
+                if current_speakers:
+                    valid_current_speakers = [
+                        s for s in current_speakers 
+                        if s["start_time"] and s["start_time"] <= seg_end_abs
+                    ]
+                    if valid_current_speakers:
+                        # Sort by start time, pick the most recent
+                        valid_current_speakers.sort(key=lambda x: x["start_time"], reverse=True)
+                        best_speaker = {
+                            "id": valid_current_speakers[0]["id"],
+                            "name": valid_current_speakers[0]["name"]
+                        }
+                        speaker_logger.debug(f"Using currently speaking fallback: {best_speaker['name']}")
+                
+                # If still no match, check for recent state changes (within last 5 seconds)
+                if not best_speaker:
+                    recent_threshold = seg_start_abs - timedelta(seconds=5)
+                    recent_speakers = []
+                    
+                    for speaker_id, speaker_data in self.speaker_states.items():
+                        last_change = speaker_data.get("last_change_time")
+                        if last_change and last_change >= recent_threshold:
+                            recent_speakers.append({
+                                "id": speaker_id,
+                                "name": speaker_data.get("name"),
+                                "last_change": last_change,
+                                "is_speaking": speaker_data.get("is_speaking", False)
+                            })
+                    
+                    if recent_speakers:
+                        # Prefer currently speaking, then most recent change
+                        recent_speakers.sort(key=lambda x: (x["is_speaking"], x["last_change"]), reverse=True)
+                        best_speaker = {
+                            "id": recent_speakers[0]["id"],
+                            "name": recent_speakers[0]["name"]
+                        }
+                        speaker_logger.debug(f"Using recent activity fallback: {best_speaker['name']}")
+            
+            # Create enhanced segment
+            enhanced_seg = seg.copy()
+            if best_speaker:
+                enhanced_seg["speaker_id"] = best_speaker["id"]
+                enhanced_seg["speaker_name"] = best_speaker["name"]
+                speaker_logger.debug(f"Enhanced match: '{seg.get('text', '')[:30]}' -> {best_speaker['name']} (overlap: {best_overlap:.2f})")
+            else:
+                # Final fallback - try to get any known speaker or use a more descriptive default
+                known_speakers = list(self.speaker_states.keys())
+                if known_speakers:
+                    # Use the first known speaker as last resort
+                    fallback_speaker_id = known_speakers[0]
+                    fallback_speaker_data = self.speaker_states[fallback_speaker_id]
+                    enhanced_seg["speaker_id"] = fallback_speaker_id
+                    enhanced_seg["speaker_name"] = fallback_speaker_data.get("name", f"Speaker {fallback_speaker_id}")
+                    speaker_logger.debug(f"Using known speaker fallback: {enhanced_seg['speaker_name']}")
+                else:
+                    # Absolute last resort
+                    enhanced_seg["speaker_id"] = "unknown"
+                    enhanced_seg["speaker_name"] = "Unknown Speaker"
+                    speaker_logger.debug(f"No speakers available - using unknown fallback")
+                
+            segments_with_speakers.append(enhanced_seg)
+            
+        return segments_with_speakers
 
     def disconnect(self):
         """
@@ -2021,11 +2251,90 @@ class ServeClientTensorRT(ServeClientBase):
                 logging.warning(f"Received message '{message_type}' for unknown client")
                 return False
             
-            # Handle speaker activity update messages (new advanced format)
-            if message_type == "speaker_activity_update":
+            # Handle audio chunk metadata messages (new)
+            if message_type == "audio_chunk_metadata":
+                chunk_id = message.get("chunk_id")
+                timestamp = message.get("timestamp")
+                duration = message.get("duration")
+                
+                if chunk_id is not None and timestamp and duration:
+                    try:
+                        # Parse and store the audio chunk metadata
+                        chunk_timestamp = dt.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        if chunk_timestamp.tzinfo is None:
+                            chunk_timestamp = chunk_timestamp.replace(tzinfo=timezone.utc)
+                            
+                        client.audio_chunks[chunk_id] = {
+                            "timestamp": chunk_timestamp,
+                            "duration": duration
+                        }
+                        
+                        # Keep only recent chunks (last 100)
+                        if len(client.audio_chunks) > 100:
+                            oldest_ids = sorted(client.audio_chunks.keys())[:len(client.audio_chunks) - 100]
+                            for old_id in oldest_ids:
+                                del client.audio_chunks[old_id]
+                                
+                        logging.debug(f"[Client {client.client_uid}] Stored audio chunk {chunk_id} at {timestamp}")
+                        
+                    except Exception as e:
+                        logging.error(f"[Client {client.client_uid}] Error processing audio_chunk_metadata: {e}")
+                        
+                return True
+            
+            # Handle speaker activity update messages (enhanced with state changes)
+            elif message_type == "speaker_activity_update":
                 logging.info(f"[Client {client.client_uid}] Received speaker_activity_update message")
                 try:
-                    # Convert speaker activity to SpeakerMeta objects
+                    # Process state changes if present
+                    speakers = message.get("speakers", [])
+                    for speaker_data in speakers:
+                        speaker_id = speaker_data.get("speaker_id")
+                        speaker_name = speaker_data.get("speaker_name")
+                        state_changes = speaker_data.get("state_changes", [])
+                        
+                        # Process state changes for precise speaker activity windows
+                        for change in state_changes:
+                            try:
+                                change_time = dt.fromisoformat(change["timestamp"].replace('Z', '+00:00'))
+                                if change_time.tzinfo is None:
+                                    change_time = change_time.replace(tzinfo=timezone.utc)
+                                    
+                                state = change["state"]  # 'started' or 'stopped'
+                                
+                                # Update speaker state tracking
+                                if speaker_id not in client.speaker_states:
+                                    client.speaker_states[speaker_id] = {
+                                        "name": speaker_name,
+                                        "is_speaking": False,
+                                        "last_change_time": None,
+                                        "activity_windows": []
+                                    }
+                                
+                                speaker_state = client.speaker_states[speaker_id]
+                                
+                                if state == "started" and not speaker_state["is_speaking"]:
+                                    speaker_state["is_speaking"] = True
+                                    speaker_state["last_change_time"] = change_time
+                                    speaker_logger.info(f"Speaker {speaker_name} started at {change_time.isoformat()}")
+                                    
+                                elif state == "stopped" and speaker_state["is_speaking"]:
+                                    if speaker_state["last_change_time"]:
+                                        # Record the activity window
+                                        speaker_state["activity_windows"].append({
+                                            "start": speaker_state["last_change_time"],
+                                            "end": change_time,
+                                            "speaker_name": speaker_name,
+                                            "speaker_id": speaker_id
+                                        })
+                                        speaker_logger.info(f"Speaker {speaker_name} stopped at {change_time.isoformat()}, window: {speaker_state['last_change_time'].isoformat()} to {change_time.isoformat()}")
+                                    speaker_state["is_speaking"] = False
+                                    speaker_state["last_change_time"] = change_time
+                                    
+                            except Exception as e:
+                                speaker_logger.error(f"Error processing state change: {e}")
+                    
+                    # Also process the traditional speaker meta data
                     speaker_meta_list = convert_speaker_activity_to_meta(message)
                     
                     if speaker_meta_list:
@@ -2235,9 +2544,10 @@ class ServeClientFasterWhisper(ServeClientBase):
         """
         if ServeClientFasterWhisper.SINGLE_MODEL:
             ServeClientFasterWhisper.SINGLE_MODEL_LOCK.acquire()
+        
         result, info = self.transcriber.transcribe(
             input_sample,
-            initial_prompt=self.initial_prompt,
+            initial_prompt=self.initial_prompt, # Reverted to static initial_prompt
             language=self.language,
             task=self.task,
             vad_filter=self.use_vad,
@@ -2421,7 +2731,8 @@ class ServeClientFasterWhisper(ServeClientBase):
                 if s.no_speech_prob > self.no_speech_thresh:
                     continue
 
-                self.transcript.append(self.format_segment(start, end, text_, completed=True))
+                formatted_segment = self.format_segment(start, end, text_, completed=True)
+                self.transcript.append(formatted_segment)
                 offset = min(duration, s.end)
 
         # only process the last segment if it satisfies the no_speech_thresh
@@ -2453,12 +2764,14 @@ class ServeClientFasterWhisper(ServeClientBase):
             if not len(self.text) or self.text[-1].strip().lower() != self.current_out.strip().lower():
                 self.text.append(self.current_out)
                 with self.lock:
-                    self.transcript.append(self.format_segment(
+                    formatted_segment_on_repeat = self.format_segment(
                         self.timestamp_offset,
                         self.timestamp_offset + min(duration, self.end_time_for_same_output),
                         self.current_out,
                         completed=True
-                    ))
+                    )
+                    self.transcript.append(formatted_segment_on_repeat)
+
             self.current_out = ''
             offset = min(duration, self.end_time_for_same_output)
             self.same_output_count = 0
