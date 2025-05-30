@@ -1207,17 +1207,8 @@ class TranscriptionServer:
             client.add_frames(frame_np)
             return True
         
-        except ConnectionClosed as e:
-            # Don't log this as an error since it's a normal WebSocket close
-            logging.info(f"WebSocket connection closed normally: {e}")
-            return False  # Stop processing for this connection
         except Exception as e:
-            # Check if it's a WebSocket-related timeout or connection error
-            error_msg = str(e).lower()
-            if any(keyword in error_msg for keyword in ['ping', 'pong', 'timeout', 'keepalive', '1005', '1011']):
-                logging.warning(f"WebSocket keepalive/timeout error (this may be normal under high load): {e}")
-            else:
-                logging.error(f"Error processing frame data: {e}")
+            logging.error(f"Error processing frame data: {e}")
             return True  # Continue processing to be safe
 
     def recv_audio(self,
@@ -1316,10 +1307,7 @@ class TranscriptionServer:
                 trt_multilingual=trt_multilingual
             ),
             host,
-            port,
-            # Increase ping timeout to handle heavy processing loads and poor network conditions
-            ping_interval=30,  # Send ping every 30 seconds (default: 20)
-            ping_timeout=60    # Wait up to 60 seconds for pong response (default: 20)
+            port
         ) as server:
             self.is_healthy = True # WebSocket server is up
             logger.info(f"SERVER_RUNNING: WhisperLive server running on {host}:{port} with health check on {host}:9091/health")
@@ -1892,38 +1880,31 @@ class ServeClientBase(object):
                 logging.error(f"ERROR: Missing required fields for client {self.client_uid}: platform={self.platform}, meeting_url={self.meeting_url}, token={self.token}")
                 return
 
-            # Try enhanced matching first if we have speaker state data
-            if self.speaker_states and any(state.get("activity_windows") for state in self.speaker_states.values()):
-                segments_with_speakers = self.match_speakers_enhanced(segments)
-                speaker_logger.info(f"Using enhanced speaker matching for {len(segments)} segments")
-            else:
-                # Fall back to original matching method
-                speaker_logger.info(f"Using traditional speaker matching for {len(segments)} segments")
-                
-                # 1. Convert raw Whisper segments to TranscriptSegment objects
-                processed_transcript_segments: List[TranscriptSegment] = []
-                for seg_data in segments: # Assuming segments is a list of dicts from Whisper
-                    try:
-                        # Pass self.transcription_start_time as t0 for relative to absolute conversion
-                        ts_seg = TranscriptSegment.from_whisper_live_segment(seg_data, t0_timestamp=self.transcription_start_time)
-                        processed_transcript_segments.append(ts_seg)
-                    except ValueError as e:
-                        speaker_logger.error(f"Skipping invalid Whisper segment: {seg_data}. Error: {e}")
-                        continue
-                
-                # 2. Match speakers to these TranscriptSegment objects
-                # Lock speaker_activity_data if it can be modified by another thread (e.g., process_websocket_message)
-                # For simplicity, direct access here assumes process_websocket_message updates it sequentially or with its own locks if needed.
-                # It might be safer to copy self.speaker_activity_data if there's a risk of concurrent modification during matching.
-                current_speaker_activity_snapshot = self.speaker_activity_data.copy() # Take a snapshot for matching
+            # Convert raw Whisper segments to PandaTranscriptSegment objects
+            processed_transcript_segments: List[PandaTranscriptSegment] = []
+            for seg_data in segments: # Assuming segments is a list of dicts from Whisper
+                try:
+                    # Pass self.transcription_start_time as t0 for relative to absolute conversion
+                    ts_seg = PandaTranscriptSegment.from_whisper_live_segment(seg_data, t0_timestamp=self.transcription_start_time)
+                    processed_transcript_segments.append(ts_seg)
+                except ValueError as e:
+                    speaker_logger.error(f"Skipping invalid Whisper segment: {seg_data}. Error: {e}")
+                    continue
+            
+            # Prepare PandaSpeakerMeta objects from self.speaker_activity_data
+            panda_speaker_activity_data = [PandaSpeakerMeta.from_whisper_live_speaker_meta(s) for s in self.speaker_activity_data]
+            
+            # Instantiate or reuse the PandaTranscriptSpeakerMatcher
+            panda_matcher = PandaTranscriptSpeakerMatcher(t0=self.transcription_start_time)
+            
+            # Match speakers to these TranscriptSegment objects
+            matched_segments = panda_matcher.match(
+                panda_speaker_activity_data, 
+                processed_transcript_segments
+            )
 
-                matched_segments = self.transcript_speaker_matcher.match(
-                    current_speaker_activity_snapshot, 
-                    processed_transcript_segments
-                )
-
-                # 3. Convert matched TranscriptSegment objects back to dictionaries for sending
-                segments_with_speakers = [ts.to_dict() for ts in matched_segments]
+            # Convert matched TranscriptSegment objects back to dictionaries for sending
+            segments_with_speakers = [ts.to_dict(t0_datetime=self.transcription_start_time) for ts in matched_segments]
             
             data = {
                 "uid": self.client_uid,
