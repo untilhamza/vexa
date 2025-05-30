@@ -1870,8 +1870,7 @@ class ServeClientBase(object):
     def send_transcription_to_client(self, segments):
         """
         Sends the specified transcription segments to the client over the websocket connection.
-        This method handles matching speakers to segments before sending using the existing
-        enhanced speaker matching algorithm.
+        This method now also handles matching speakers to segments before sending.
 
         Args:
             segments (list): A list of raw transcription segments (dictionaries) from Whisper.
@@ -1881,12 +1880,35 @@ class ServeClientBase(object):
                 logging.error(f"ERROR: Missing required fields for client {self.client_uid}: platform={self.platform}, meeting_url={self.meeting_url}, token={self.token}")
                 return
 
-            # Use the existing enhanced speaker matching method
-            segments_with_speakers = self.match_speakers_enhanced(segments)
+            # Convert raw Whisper segments to PandaTranscriptSegment objects
+            processed_transcript_segments: List[PandaTranscriptSegment] = []
+            for seg_data in segments: # Assuming segments is a list of dicts from Whisper
+                try:
+                    # Pass self.transcription_start_time as t0 for relative to absolute conversion
+                    ts_seg = PandaTranscriptSegment.from_whisper_live_segment(seg_data, t0_timestamp=self.transcription_start_time)
+                    processed_transcript_segments.append(ts_seg)
+                except ValueError as e:
+                    speaker_logger.error(f"Skipping invalid Whisper segment: {seg_data}. Error: {e}")
+                    continue
+            
+            # Prepare PandaSpeakerMeta objects from self.speaker_activity_data
+            panda_speaker_activity_data = [PandaSpeakerMeta.from_whisper_live_speaker_meta(s) for s in self.speaker_activity_data]
+            
+            # Instantiate or reuse the PandaTranscriptSpeakerMatcher
+            panda_matcher = PandaTranscriptSpeakerMatcher(t0=self.transcription_start_time)
+            
+            # Match speakers to these TranscriptSegment objects
+            matched_segments = panda_matcher.match(
+                panda_speaker_activity_data, 
+                processed_transcript_segments
+            )
+
+            # Convert matched TranscriptSegment objects back to dictionaries for sending
+            segments_with_speakers = [ts.to_dict(t0_datetime=self.transcription_start_time) for ts in matched_segments]
             
             data = {
                 "uid": self.client_uid,
-                "segments": segments_with_speakers,
+                "segments": segments_with_speakers, # Send the matched segments
             }
             self.websocket.send(json.dumps(data))
             
@@ -1896,11 +1918,11 @@ class ServeClientBase(object):
                     token=self.token,
                     platform=self.platform,
                     meeting_id=self.meeting_id,
-                    segments=segments_with_speakers,
+                    segments=segments_with_speakers, # Send matched segments to collector as well
                     session_uid=self.client_uid,
+                    # speaker_id and speaker_name are now part of each segment in segments_to_send
                 )
-            
-            # Log the transcription data to file with detailed formatting 
+             # Log the transcription data to file with more detailed formatting 
             formatted_log_segments = []
             for i, seg_dict in enumerate(segments_with_speakers):
                 speaker_name = seg_dict.get('speaker_name', 'Unknown')
@@ -1908,11 +1930,13 @@ class ServeClientBase(object):
                 text_content = seg_dict.get('text', '')
                 start_time = seg_dict.get('start', 'N/A')
                 end_time = seg_dict.get('end', 'N/A')
+                completed_status = 'COMPLETE' if seg_dict.get('completed', False) else 'PARTIAL' # Assuming 'completed' might be added to to_dict if needed
 
                 formatted_log_segments.append(
                     f"[{i}] ({start_time}-{end_time}) "
+                    f"[{completed_status}] " 
                     f"[Speaker: {speaker_name} ({speaker_id})]: "
-                    f'"{text_content}"'
+                    f"\"{text_content}\""
                 )
                     
             logger.info(f"TRANSCRIPTION: client={self.client_uid}, platform={self.platform}, meeting_url={self.meeting_url}, token={self.token}, meeting_id={self.meeting_id}, segments=\n" + "\n".join(formatted_log_segments))

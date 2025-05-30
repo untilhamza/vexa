@@ -414,7 +414,6 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
 
               socket.onmessage = (event) => {
                 try {
-                  (window as any).logBot("Received message: " + event.data);
                   const data = JSON.parse(event.data);
 
                   if (data["status"] === "ERROR") {
@@ -435,11 +434,23 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                     if (socket) {
                       socket.close();
                     }
-                  } else {
-                    (window as any).logBot(
-                      `Transcription: ${JSON.stringify(data)}`
-                    );
+                  } else if (data["text"] || data["transcript"]) {
+                    // Clean transcription logging - only show essential info
+                    const text = data["text"] || data["transcript"] || "";
+                    const speaker = data["speaker"] || data["speaker_name"] || "Unknown";
+                    const completed = data["completed"] || data["final"] || false;
+                    const start = data["start"] || data["start_time"] || "";
+                    const end = data["end"] || data["end_time"] || "";
+                    
+                    if (text.trim()) {
+                      const status = completed ? "FINAL" : "PARTIAL";
+                      const timeInfo = start && end ? ` [${start}-${end}]` : "";
+                      (window as any).logBot(
+                        `${status} | ${speaker}: "${text}"${timeInfo}`
+                      );
+                    }
                   }
+                  // Remove the generic "Transcription: JSON.stringify(data)" log
                 } catch (err: any) {
                   (window as any).logBot(
                     `Error parsing WebSocket message: ${err.message}`
@@ -838,178 +849,382 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                 timestamp: string;
                 state: "started" | "stopped";
               }>;
+              visualIndicators: {
+                hasAudioWave: boolean;
+                hasSpeakingRing: boolean;
+                hasVoiceIndicator: boolean;
+                elementBrightness: number;
+              };
             }> = [];
             let callName: string | null = null;
-            let nodeRefreshCounter = 0; // To refresh nodes less frequently
-            let sendDataCounter = 0; // To send data less frequently than raw polling
+            let nodeRefreshCounter = 0;
+            let sendDataCounter = 0;
 
-            const peopleButtonSelector =
-              'button[aria-label="People"][data-panel-id="1"]';
+            // --- ADDED: Real-time mutation observer for immediate speaking detection ---
+            let mutationObserver: MutationObserver | null = null;
+            let realtimeSpeakingStates = new Map<string, boolean>();
+
+            const setupMutationObserver = () => {
+              if (mutationObserver) {
+                mutationObserver.disconnect();
+              }
+
+              mutationObserver = new MutationObserver((mutations) => {
+                mutations.forEach((mutation) => {
+                  if (mutation.type === 'attributes' || mutation.type === 'childList') {
+                    // Check if this mutation might be related to speaking indicators
+                    const target = mutation.target as HTMLElement;
+                    if (target && (target.closest('[data-participant-id]') || target.matches('[data-participant-id]'))) {
+                      const participantEl = target.closest('[data-participant-id]') || target;
+                      const participantId = participantEl.getAttribute('data-participant-id');
+                      
+                      if (participantId) {
+                        const isSpeaking = detectSpeakingForElement(participantEl as HTMLElement);
+                        const previousState = realtimeSpeakingStates.get(participantId) || false;
+                        
+                        if (isSpeaking !== previousState) {
+                          realtimeSpeakingStates.set(participantId, isSpeaking);
+                          const participantName = getParticipantName(participantEl as HTMLElement);
+                          (window as any).logBot(
+                            `REALTIME: ${participantName} ${isSpeaking ? 'started' : 'stopped'} speaking (via mutation)`
+                          );
+                        }
+                      }
+                    }
+                  }
+                });
+              });
+
+              // Observe the entire participants area for changes
+              const participantsArea = document.querySelector('[role="list"]') || document.body;
+              mutationObserver.observe(participantsArea, {
+                attributes: true,
+                childList: true,
+                subtree: true,
+                attributeFilter: ['class', 'style', 'data-speaking', 'aria-label']
+              });
+            };
+
+            // --- IMPROVED: Multi-strategy speaking detection ---
+            const detectSpeakingForElement = (participantEl: HTMLElement): boolean => {
+              let isSpeaking = false;
+              let detectionMethods: string[] = [];
+
+              // Strategy 1: CSS class detection (expanded list)
+              const speakingClasses = [
+                "HX2H7", "gZuAFe", "L5Lhkd", "SfqTBc", "speaking", "voice-active",
+                "mic-active", "audio-indicator", "voice-indicator", "is-speaking",
+                "participant-speaking", "user-speaking", "active-speaker"
+              ];
+              
+              for (const className of speakingClasses) {
+                if (participantEl.classList.contains(className) || 
+                    participantEl.querySelector(`.${className}`)) {
+                  isSpeaking = true;
+                  detectionMethods.push(`class:${className}`);
+                  break;
+                }
+              }
+
+              // Strategy 2: Visual speaking indicators (audio waves, rings, etc.)
+              if (!isSpeaking) {
+                const visualIndicators = [
+                  'svg[data-speaking]', 'div[data-speaking="true"]',
+                  '.voice-visualization', '.audio-wave', '.speaking-animation',
+                  '[aria-label*="speaking"]', '[aria-label*="voice"]',
+                  '.mic-indicator.active', '.voice-level'
+                ];
+                
+                for (const selector of visualIndicators) {
+                  if (participantEl.querySelector(selector)) {
+                    isSpeaking = true;
+                    detectionMethods.push(`visual:${selector}`);
+                    break;
+                  }
+                }
+              }
+
+              // Strategy 3: Style-based detection (opacity, transform, background changes)
+              if (!isSpeaking) {
+                const computedStyle = window.getComputedStyle(participantEl);
+                const micElements = participantEl.querySelectorAll('[class*="mic"], [class*="audio"], [class*="voice"]');
+                
+                micElements.forEach((micEl: Element) => {
+                  const micStyle = window.getComputedStyle(micEl as HTMLElement);
+                  // Check for style changes that indicate speaking
+                  if (micStyle.opacity !== '0' && micStyle.opacity !== '0.5' && 
+                      (micStyle.transform !== 'none' || micStyle.backgroundColor !== 'rgba(0, 0, 0, 0)')) {
+                    isSpeaking = true;
+                    detectionMethods.push('style:mic-active');
+                  }
+                });
+              }
+
+              // Strategy 4: Attribute-based detection
+              if (!isSpeaking) {
+                const speakingAttributes = ['data-speaking', 'data-voice-active', 'data-audio-active'];
+                for (const attr of speakingAttributes) {
+                  if (participantEl.getAttribute(attr) === 'true' || 
+                      participantEl.querySelector(`[${attr}="true"]`)) {
+                    isSpeaking = true;
+                    detectionMethods.push(`attr:${attr}`);
+                    break;
+                  }
+                }
+              }
+
+              // Strategy 5: Brightness/highlight detection
+              if (!isSpeaking) {
+                const style = window.getComputedStyle(participantEl);
+                const brightnessMatch = style.filter.match(/brightness\(([^)]+)\)/);
+                const brightness = brightnessMatch ? parseFloat(brightnessMatch[1]) : 1;
+                if (brightness > 1.2) {
+                  isSpeaking = true;
+                  detectionMethods.push('brightness');
+                }
+              }
+
+              // Strategy 6: Check for animated elements (speaking indicators often animate)
+              if (!isSpeaking) {
+                const animatedElements = participantEl.querySelectorAll('*');
+                animatedElements.forEach((el: Element) => {
+                  const style = window.getComputedStyle(el as HTMLElement);
+                  if (style.animationName !== 'none' && style.animationName !== '') {
+                    isSpeaking = true;
+                    detectionMethods.push('animation');
+                  }
+                });
+              }
+
+              // Strategy 7: Advanced DOM scanning - look for any element changes
+              if (!isSpeaking) {
+                // Check for any elements with recent style changes that might indicate speaking
+                const allChildElements = participantEl.querySelectorAll('*');
+                allChildElements.forEach((child: Element) => {
+                  const childEl = child as HTMLElement;
+                  const style = window.getComputedStyle(childEl);
+                  
+                  // Look for elements with transforms, shadows, or color changes
+                  if (style.transform !== 'none' && style.transform !== 'matrix(1, 0, 0, 1, 0, 0)' ||
+                      style.boxShadow !== 'none' ||
+                      style.borderColor !== 'rgba(0, 0, 0, 0)' && style.borderColor !== 'transparent') {
+                    isSpeaking = true;
+                    detectionMethods.push('dom-scan:styling');
+                  }
+                });
+              }
+
+              // Strategy 8: Check participant list ordering (active speakers often move to top)
+              if (!isSpeaking) {
+                const participantList = participantEl.closest('[role="list"]');
+                if (participantList) {
+                  const allParticipants = Array.from(participantList.querySelectorAll('[data-participant-id]'));
+                  const currentIndex = allParticipants.indexOf(participantEl);
+                  // If this participant is in the first 2 positions and wasn't there before, might be speaking
+                  if (currentIndex < 2) {
+                    isSpeaking = true;
+                    detectionMethods.push('position:top-ranked');
+                  }
+                }
+              }
+
+              // --- ADDED: Debug logging to understand DOM structure when no detection works ---
+              const participantName = getParticipantName(participantEl);
+              if (!isSpeaking && nodeRefreshCounter < 10) {
+                // Log DOM structure for first few cycles to understand what we're missing
+                const allClasses = Array.from(participantEl.classList);
+                const allChildren = Array.from(participantEl.querySelectorAll('*')).slice(0, 10); // First 10 children
+                const childrenInfo = allChildren.map(child => {
+                  const classes = Array.from(child.classList).join(',');
+                  return `${child.tagName}${classes ? '.' + classes : ''}`;
+                }).join(' | ');
+                
+                (window as any).logBot(
+                  `DOM_DEBUG ${participantName}: classes=[${allClasses.join(',')}] children=[${childrenInfo}]`
+                );
+              }
+
+              // Log detection methods for debugging
+              if (isSpeaking && detectionMethods.length > 0) {
+                (window as any).logBot(
+                  `DETECTION: ${participantName} speaking detected via: ${detectionMethods.join(', ')}`
+                );
+              }
+
+              return isSpeaking;
+            };
+
+            // Helper function to get participant name
+            const getParticipantName = (participantEl: HTMLElement): string => {
+              const nameSelectors = [
+                '[data-self-name]', '.zWGUib', '.cS7aqe.N2K3jd', 
+                '[data-tooltip*="name"]', '.participant-name'
+              ];
+              
+              for (const selector of nameSelectors) {
+                const nameEl = participantEl.querySelector(selector) as HTMLElement;
+                if (nameEl && nameEl.innerText?.trim()) {
+                  return nameEl.innerText.split('\n').pop()?.trim() || 'Unknown';
+                }
+              }
+              return 'Unknown Participant';
+            };
+
+            const peopleButtonSelector = 'button[aria-label="People"][data-panel-id="1"]';
 
             const ensurePeoplePanelOpen = async () => {
-              const peopleButton = document.querySelector(
-                peopleButtonSelector
-              ) as HTMLElement;
+              const peopleButton = document.querySelector(peopleButtonSelector) as HTMLElement;
               if (!peopleButton) {
-                (window as any).logBot(
-                  "WARNING: People button not found for speaker detection."
-                );
+                (window as any).logBot("WARNING: People button not found for speaker detection.");
                 return false;
               }
               const isPressed = peopleButton.getAttribute("aria-pressed");
               if (isPressed !== "true") {
-                (window as any).logBot(
-                  "Opening People panel for speaker detection..."
-                );
+                (window as any).logBot("Opening People panel for speaker detection...");
                 peopleButton.click();
-                await new Promise((r) => setTimeout(r, 1500)); // Wait for panel to open
+                await new Promise((r) => setTimeout(r, 1500));
               }
               return true;
             };
 
+            // Setup mutation observer initially
+            setupMutationObserver();
+
+            // --- ADDED: Continuous DOM scanner for aggressive detection ---
+            let continuousScanner: ReturnType<typeof setInterval> | null = null;
+            
+            const startContinuousScanning = () => {
+              continuousScanner = setInterval(() => {
+                if (!socket || socket.readyState !== WebSocket.OPEN || !isServerReady) {
+                  return;
+                }
+                
+                // Scan all participants every 100ms for immediate detection
+                const allParticipants = document.querySelectorAll('[data-participant-id]');
+                allParticipants.forEach((participantEl: Element) => {
+                  const participantId = participantEl.getAttribute('data-participant-id');
+                  if (participantId) {
+                    const isSpeaking = detectSpeakingForElement(participantEl as HTMLElement);
+                    const previousState = realtimeSpeakingStates.get(participantId) || false;
+                    
+                    if (isSpeaking !== previousState) {
+                      realtimeSpeakingStates.set(participantId, isSpeaking);
+                      const participantName = getParticipantName(participantEl as HTMLElement);
+                      (window as any).logBot(
+                        `CONTINUOUS_SCAN: ${participantName} ${isSpeaking ? 'started' : 'stopped'} speaking`
+                      );
+                    }
+                  }
+                });
+              }, 100); // Scan every 100ms for ultra-responsive detection
+            };
+            
+            startContinuousScanning();
+            // --- END of continuous scanning ---
+
             micPollingInterval = setInterval(async () => {
               try {
-                if (
-                  !socket ||
-                  socket.readyState !== WebSocket.OPEN ||
-                  !isServerReady
-                ) {
-                  // (window as any).logBot( // Optional: this log can be very noisy
-                  //   "AdvancedSpeakerMonitoring: WS not ready or closed, skipping cycle."
-                  // );
+                if (!socket || socket.readyState !== WebSocket.OPEN || !isServerReady) {
                   return;
                 }
 
                 nodeRefreshCounter++;
                 sendDataCounter++;
 
-                // Refresh participant nodes and call name every 50 cycles (50 * 50ms = 2.5 seconds)
-                if (nodeRefreshCounter % 50 === 1) {
+                // Refresh participant nodes every 25 cycles (25 * 50ms = 1.25 seconds) - more frequent
+                if (nodeRefreshCounter % 25 === 1) {
                   if (!(await ensurePeoplePanelOpen())) {
-                    (window as any).logBot(
-                      "AdvancedSpeakerMonitoring: Cannot ensure people panel is open. Skipping node refresh."
-                    );
-                    // Potentially stop or retry opening panel later
+                    (window as any).logBot("Cannot ensure people panel is open. Skipping node refresh.");
                   } else {
                     participantNodes = [];
-                    callName =
-                      (
-                        document.querySelector(
-                          "[jscontroller=yEvoid]"
-                        ) as HTMLDivElement | null
-                      )?.innerText?.trim() || "Unknown Call";
+                    callName = (document.querySelector("[jscontroller=yEvoid]") as HTMLDivElement | null)?.innerText?.trim() || "Unknown Call";
 
                     const participantElements = Array.from(
-                      document.querySelectorAll(
-                        'div[role="listitem"][data-participant-id]'
-                      )
+                      document.querySelectorAll('div[role="listitem"][data-participant-id]')
                     ) as HTMLElement[];
 
-                    (window as any).logBot(
-                      `AdvancedSpeakerMonitoring: Found ${participantElements.length} participant elements.`
-                    );
+                    (window as any).logBot(`Found ${participantElements.length} participant elements.`);
 
                     participantElements.forEach((el: HTMLElement) => {
-                      const participantId = el.getAttribute(
-                        "data-participant-id"
-                      );
+                      const participantId = el.getAttribute("data-participant-id");
                       if (!participantId) return;
 
-                      let nameNode = el.querySelector(
-                        "[data-self-name]"
-                      ) as HTMLElement;
-                      if (!nameNode) {
-                        // Fallback selector, adjust if needed based on actual Google Meet DOM for participant names
-                        nameNode = el.querySelector(
-                          "span.zWGUib"
-                        ) as HTMLElement; // Common selector for name
-                      }
-                      // More robust name extraction, trying different common selectors
-                      let name = "Unknown Participant";
-                      if (nameNode) {
-                        name =
-                          nameNode.innerText?.split("\n").pop()?.trim() ||
-                          `Participant ${participantId}`;
-                      } else {
-                        // Try another common selector if the first one fails
-                        const secondaryNameNode = el.querySelector(
-                          ".cS7aqe.N2K3jd"
-                        ) as HTMLElement; // Another possible name element
-                        if (secondaryNameNode) {
-                          name =
-                            secondaryNameNode.innerText?.trim() ||
-                            `Participant ${participantId}`;
-                        } else {
-                          (window as any).logBot(
-                            `AdvancedSpeakerMonitoring: Name node not found for participant ${participantId}. Using default.`
-                          );
-                        }
-                      }
+                      const name = getParticipantName(el);
 
-                      const micNode = el.querySelector(
-                        'div[jscontroller="ES310d"]'
-                      ) as HTMLElement; // Google's mic status container
+                      // Try multiple mic node selectors
+                      const micNodeSelectors = [
+                        'div[jscontroller="ES310d"]', '[data-self-name] + div',
+                        '.mic-indicator', '[aria-label*="microphone"]',
+                        '.participant-microphone', 'div[data-participant-id] div[class*="mic"]',
+                      ];
+                      
+                      let micNode: HTMLElement | null = null;
+                      for (const selector of micNodeSelectors) {
+                        micNode = el.querySelector(selector) as HTMLElement;
+                        if (micNode) break;
+                      }
+                      
+                      if (!micNode) micNode = el; // Use participant element as fallback
 
                       if (micNode && name) {
-                        // Ensure micNode and name are found
                         participantNodes.push({
                           id: participantId,
                           name: name,
                           el: el,
                           micNode: micNode,
                           micActivity: [],
-                          lastState: false, // Initialize as not speaking
-                          stateChanges: [], // Initialize empty state changes
+                          lastState: realtimeSpeakingStates.get(participantId) || false,
+                          stateChanges: [],
+                          visualIndicators: {
+                            hasAudioWave: false,
+                            hasSpeakingRing: false,
+                            hasVoiceIndicator: false,
+                            elementBrightness: 1
+                          }
                         });
-                      } else {
-                        (window as any).logBot(
-                          `AdvancedSpeakerMonitoring: Skipping participant ${participantId} due to missing mic or name node.`
-                        );
                       }
                     });
-                    (window as any).logBot(
-                      `AdvancedSpeakerMonitoring: Refreshed ${participantNodes.length} participant nodes. Call Name: ${callName}`
-                    );
+
+                    (window as any).logBot(`Refreshed ${participantNodes.length} participant nodes. Call: ${callName}`);
+                    
+                    // Refresh mutation observer with new participant area
+                    setupMutationObserver();
                   }
                 }
 
-                // Record mic activity for each participant
+                // Record mic activity for each participant using multi-strategy detection
                 participantNodes.forEach((node) => {
-                  if (node && node.micNode) {
-                    const isSpeaking = node.micNode.classList.contains("HX2H7");
-                    node.micActivity.push(isSpeaking ? "1" : "0");
+                  if (node && node.el) {
+                    const isSpeaking = detectSpeakingForElement(node.el);
+                    
+                    // Combine polling detection with real-time state
+                    const realtimeState = realtimeSpeakingStates.get(node.id) || false;
+                    const finalSpeakingState = isSpeaking || realtimeState;
+                    
+                    node.micActivity.push(finalSpeakingState ? "1" : "0");
 
-                    // --- ADDED: Track state changes with precise timestamps ---
-                    if (isSpeaking !== node.lastState) {
+                    // Track state changes
+                    if (finalSpeakingState !== node.lastState) {
                       const changeTimestamp = new Date().toISOString();
                       node.stateChanges.push({
                         timestamp: changeTimestamp,
-                        state: isSpeaking ? "started" : "stopped",
+                        state: finalSpeakingState ? "started" : "stopped",
                       });
-                      node.lastState = isSpeaking;
+                      node.lastState = finalSpeakingState;
+                      realtimeSpeakingStates.set(node.id, finalSpeakingState);
 
-                      // Log state change
                       (window as any).logBot(
-                        `Speaker ${node.name} ${
-                          isSpeaking ? "started" : "stopped"
-                        } speaking at ${changeTimestamp}`
+                        `${node.name} ${finalSpeakingState ? "started" : "stopped"} speaking at ${changeTimestamp}`
                       );
                     }
-                    // --- ---------------------------------------------------- ---
                   }
                 });
 
                 // Send data every 10 cycles (10 * 50ms = 0.5 seconds)
                 if (sendDataCounter % 10 === 0) {
-                  if (
-                    socket &&
-                    socket.readyState === WebSocket.OPEN &&
-                    isServerReady &&
-                    participantNodes.length > 0
-                  ) {
+                  if (socket && socket.readyState === WebSocket.OPEN && isServerReady && participantNodes.length > 0) {
                     const timestamp = new Date().toISOString();
 
-                    // --- MODIFIED: Include state changes in payload ---
                     const payload = {
                       type: "speaker_activity_update",
                       uid: (window as any).currentWsUid || generateUUID(),
@@ -1020,61 +1235,61 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                         speaker_id: p.id,
                         speaker_name: p.name,
                         mic_activity_bits: p.micActivity.join(""),
-                        delay_sec: 0.1, // Reduced delay since we're tracking more precisely
-                        state_changes: p.stateChanges, // Include state changes
+                        delay_sec: 0.05, // Reduced delay for more responsive detection
+                        state_changes: p.stateChanges,
+                        realtime_state: realtimeSpeakingStates.get(p.id) || false
                       })),
-                      // Include recent audio chunk info for correlation
-                      recent_audio_chunks: audioChunkTimestamps.slice(-10), // Last 10 chunks
+                      recent_audio_chunks: audioChunkTimestamps.slice(-10),
                     };
-                    // --- ---------------------------------------------- ---
 
                     let payloadStr;
                     try {
                       payloadStr = JSON.stringify(payload);
                     } catch (stringifyError: any) {
-                      (window as any).logBot(
-                        `AdvancedSpeakerMonitoring: ERROR stringifying payload: ${stringifyError.message}`
-                      );
-                      return; // Don't proceed if payload is bad
+                      (window as any).logBot(`ERROR stringifying payload: ${stringifyError.message}`);
+                      return;
                     }
-                    (window as any).logBot(
-                      `AdvancedSpeakerMonitoring: Sending speaker activity payload: ${payloadStr}`
-                    );
+                    
+                    // Enhanced speaker activity summary
+                    const speakerSummary = payload.speakers.map(s => {
+                      const isActive = s.mic_activity_bits.includes('1') || s.realtime_state;
+                      return `${s.speaker_name}: ${isActive ? 'SPEAKING' : 'silent'}`;
+                    }).join(', ');
+                    
+                    (window as any).logBot(`Speaker Activity: ${speakerSummary}`);
+                    
                     socket.send(payloadStr);
-                    (window as any).logBot(
-                      `AdvancedSpeakerMonitoring: Sent speaker activity update. Participants: ${payload.speakers.length}`
-                    );
-
-                    // Clear processed data
+                    
+                    // Clear processed data - but preserve recent activity for continuity
                     participantNodes.forEach((p) => {
-                      p.micActivity = [];
-                      p.stateChanges = []; // Clear state changes after sending
+                      const recentActivity = p.micActivity.slice(-3);
+                      p.micActivity = recentActivity;
+                      p.stateChanges = [];
                     });
-                  } else if (
-                    participantNodes.length === 0 &&
-                    nodeRefreshCounter > 50
-                  ) {
-                    (window as any).logBot(
-                      "AdvancedSpeakerMonitoring: No participant nodes to send data for, or socket not ready."
-                    );
                   }
                 }
               } catch (error: any) {
-                (window as any).logBot(
-                  `AdvancedSpeakerMonitoring: Interval CRITICAL ERROR: ${
-                    error.message
-                  }${error.stack ? "\nStack: " + error.stack : ""}`
-                );
-                // Optional: To prevent repeated errors, though this might hide the root cause.
-                // if (micPollingInterval) {
-                //   clearInterval(micPollingInterval);
-                //   micPollingInterval = null;
-                //   (window as any).logBot("AdvancedSpeakerMonitoring: Cleared interval due to critical error.");
-                // }
+                (window as any).logBot(`AdvancedSpeakerMonitoring: CRITICAL ERROR: ${error.message}`);
               }
-            }, 50); // Poll every 50ms
+            }, 50); // Poll every 50ms for high responsiveness
+
+            // Cleanup function
+            addCleanupFunction(() => {
+              if (mutationObserver) {
+                mutationObserver.disconnect();
+                mutationObserver = null;
+              }
+              if (micPollingInterval) {
+                clearInterval(micPollingInterval);
+                micPollingInterval = null;
+              }
+              if (continuousScanner) {
+                clearInterval(continuousScanner);
+                continuousScanner = null;
+              }
+            });
           };
-          // --- END OF New Advanced Speaker Monitoring Function ---
+          // --- END OF Enhanced Advanced Speaker Monitoring Function ---
         } catch (error: any) {
           performGlobalCleanup();
           return reject(new Error("[BOT Error] " + error.message));
