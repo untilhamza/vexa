@@ -1207,8 +1207,17 @@ class TranscriptionServer:
             client.add_frames(frame_np)
             return True
         
+        except ConnectionClosed as e:
+            # Don't log this as an error since it's a normal WebSocket close
+            logging.info(f"WebSocket connection closed normally: {e}")
+            return False  # Stop processing for this connection
         except Exception as e:
-            logging.error(f"Error processing frame data: {e}")
+            # Check if it's a WebSocket-related timeout or connection error
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['ping', 'pong', 'timeout', 'keepalive', '1005', '1011']):
+                logging.warning(f"WebSocket keepalive/timeout error (this may be normal under high load): {e}")
+            else:
+                logging.error(f"Error processing frame data: {e}")
             return True  # Continue processing to be safe
 
     def recv_audio(self,
@@ -1307,7 +1316,10 @@ class TranscriptionServer:
                 trt_multilingual=trt_multilingual
             ),
             host,
-            port
+            port,
+            # Increase ping timeout to handle heavy processing loads and poor network conditions
+            ping_interval=30,  # Send ping every 30 seconds (default: 20)
+            ping_timeout=60    # Wait up to 60 seconds for pong response (default: 20)
         ) as server:
             self.is_healthy = True # WebSocket server is up
             logger.info(f"SERVER_RUNNING: WhisperLive server running on {host}:{port} with health check on {host}:9091/health")
