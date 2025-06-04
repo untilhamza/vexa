@@ -180,7 +180,7 @@ up: check_docker
 	@echo "---> Starting Docker Compose services..."
 	@if [ "$(TARGET)" = "cpu" ]; then \
 		echo "---> Activating 'cpu' profile to start whisperlive-cpu along with other services..."; \
-		docker compose --profile cpu up -d; \
+		docker compose --profile cpu up; \
 	elif [ "$(TARGET)" = "gpu" ]; then \
 		echo "---> Starting services for GPU. This will start 'whisperlive' (for GPU) and other default services. 'whisperlive-cpu' (profile=cpu) will not be started."; \
 		docker compose --profile gpu up -d; \
